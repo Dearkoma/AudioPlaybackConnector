@@ -24,7 +24,7 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 
 ### 预览
 
-![预览](https://cdn.jsdelivr.net/gh/Dearkoma/AudioPlaybackConnector@master/AudioPlaybackConnector.gif)
+![预览](https://raw.githubusercontent.com/Dearkoma/AudioPlaybackConnector/master/AudioPlaybackConnector.gif)
 
 ### 构建系统
 

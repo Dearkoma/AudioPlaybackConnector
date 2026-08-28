@@ -24,7 +24,7 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 
 ### Preview
 
-![Preview](https://cdn.jsdelivr.net/gh/Dearkoma/AudioPlaybackConnector@master/AudioPlaybackConnector.gif)
+![Preview](https://raw.githubusercontent.com/Dearkoma/AudioPlaybackConnector/master/AudioPlaybackConnector.gif)
 
 ### Build System
 
