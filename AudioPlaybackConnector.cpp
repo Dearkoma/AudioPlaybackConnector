@@ -853,9 +853,13 @@ void ShowDeviceFlyout()
 		g_flyoutRoot.Measure(Size{ kFlyoutWidthDip, 4000.0f });
 		auto desired = g_flyoutRoot.DesiredSize();
 
+		// windows.h defines min/max macros, so std::clamp/std::max would be
+		// mangled in this translation unit; clamp explicitly instead.
+		auto clampTo = [](int value, int low, int high) { return value < low ? low : (value > high ? high : value); };
+
 		const int width = MulDiv(static_cast<int>(kFlyoutWidthDip), dpi, USER_DEFAULT_SCREEN_DPI);
 		int height = static_cast<int>(std::lround(desired.Height * dpi / USER_DEFAULT_SCREEN_DPI));
-		height = std::clamp(height, MulDiv(96, dpi, USER_DEFAULT_SCREEN_DPI), MulDiv(560, dpi, USER_DEFAULT_SCREEN_DPI));
+		height = clampTo(height, MulDiv(96, dpi, USER_DEFAULT_SCREEN_DPI), MulDiv(560, dpi, USER_DEFAULT_SCREEN_DPI));
 
 		// Anchor to the tray icon: above it and right-aligned, like a tray flyout.
 		RECT icon{};
@@ -874,8 +878,12 @@ void ShowDeviceFlyout()
 		if (GetMonitorInfoW(MonitorFromRect(&icon, MONITOR_DEFAULTTONEAREST), &monitor))
 		{
 			const RECT& work = monitor.rcWork;
-			x = std::clamp(x, static_cast<int>(work.left), std::max(static_cast<int>(work.left), static_cast<int>(work.right) - width));
-			y = std::clamp(y, static_cast<int>(work.top), std::max(static_cast<int>(work.top), static_cast<int>(work.bottom) - height));
+			const int lowestX = static_cast<int>(work.left);
+			const int lowestY = static_cast<int>(work.top);
+			const int highestX = static_cast<int>(work.right) - width;
+			const int highestY = static_cast<int>(work.bottom) - height;
+			x = clampTo(x, lowestX, highestX < lowestX ? lowestX : highestX);
+			y = clampTo(y, lowestY, highestY < lowestY ? lowestY : highestY);
 		}
 
 		SetWindowPos(g_hWndFlyout, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
@@ -990,7 +998,7 @@ void DisconnectDevice(std::wstring const& deviceId)
 		// object for the device and close it so the button still does something.
 		try
 		{
-			if (auto connection = AudioPlaybackConnection::TryCreateFromId(deviceId))
+			if (auto connection = AudioPlaybackConnection::TryCreateFromId(winrt::hstring(deviceId.c_str())))
 			{
 				connection.Close();
 				LogEvent(L"Disconnect (external link): %s", deviceId.c_str());
@@ -1226,7 +1234,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			}
 		}
 		LogEvent(L"Connect failed: %s  (%s)", device.Name().c_str(), errorMessage.c_str());
-		UpdateDeviceStatus(device.Id(), errorMessage, DeviceAction::Retry);
+		UpdateDeviceStatus(device.Id(), winrt::hstring(errorMessage.c_str()), DeviceAction::Retry);
 	}
 }
 
@@ -1234,7 +1242,9 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
 	if (g_shuttingDown) co_return;
 
-	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
+	// Kept in a local so it outlives the suspension point.
+	const winrt::hstring id(deviceId.c_str());
+	auto device = co_await DeviceInformation::CreateFromIdAsync(id);
 	if (g_shuttingDown) co_return;
 	ConnectDevice(device);
 }

@@ -52,6 +52,10 @@
 // being included by accident.
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+// TextBlock.FontWeight hands out a Windows.UI.Text.FontWeight; without this
+// header FontWeights' static getters are only declared, not defined ("C3779:
+// a function that returns 'auto' cannot be used before it is defined").
+#include <winrt/Windows.UI.Text.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>
