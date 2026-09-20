@@ -46,6 +46,12 @@
 #include <winrt/Windows.Foundation.Metadata.h>
 #include <winrt/Windows.Media.Audio.h>
 #include <winrt/Windows.System.h>
+// Needed by the self-drawn device flyout (Thickness, GridLength, Visibility,
+// SolidColorBrush, ...). Controls.h pulls most of this in transitively, but
+// the dependencies are stated explicitly so the flyout never depends on them
+// being included by accident.
+#include <winrt/Windows.UI.Xaml.h>
+#include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Hosting.h>

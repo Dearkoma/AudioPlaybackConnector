@@ -1,7 +1,10 @@
 #pragma once
 
 #include "resource.h"
+#include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 
 using namespace winrt::Windows::Data::Json;
 using namespace winrt::Windows::Devices::Enumeration;
@@ -16,13 +19,58 @@ constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_CONNECTION_CLOSED = WM_APP + 3; // StateChanged → UI thread marshal
 
+// Action offered by a device row's button in the flyout. None disables the
+// button (a connect is already in flight for that device).
+enum class DeviceAction
+{
+	None,
+	Connect,
+	Disconnect,
+	Retry
+};
+
+// Holds what a row's button click handler needs. The handler captures a
+// shared_ptr to this, so the row's action can be re-targeted later (for
+// example connect → disconnect once the connection succeeds) without
+// rebuilding the row.
+struct DeviceRowState
+{
+	std::wstring deviceId;
+	DeviceAction action = DeviceAction::None;
+};
+
+// One rendered device row in the self-drawn flyout.
+struct DeviceRow
+{
+	std::wstring deviceId;
+	TextBlock statusText{ nullptr };
+	Button actionButton{ nullptr };
+	std::shared_ptr<DeviceRowState> state;
+};
+
 HINSTANCE g_hInst;
 HWND g_hWnd;
-HWND g_hWndXaml;
-Canvas g_xamlCanvas = nullptr;
-DevicePicker g_devicePicker = nullptr;
-DesktopWindowXamlSource g_desktopSource = nullptr;
-winrt::com_ptr<IDesktopWindowXamlSourceNative2> g_desktopSourceNative2;
+
+// The device flyout is drawn by this app instead of using the system device
+// picker, because the picker exposes no way to add a refresh indicator or a
+// refresh button. It lives in its own top-level popup window with its own XAML
+// island; the window and the XAML tree are created once and reused, so
+// connection state survives between opens.
+HWND g_hWndFlyout = nullptr;
+DesktopWindowXamlSource g_flyoutSource = nullptr;
+winrt::com_ptr<IDesktopWindowXamlSourceNative2> g_flyoutSourceNative2;
+Grid g_flyoutRoot = nullptr;
+TextBlock g_flyoutTitle = nullptr;
+TextBlock g_flyoutSubtitle = nullptr;
+Button g_flyoutRefreshButton = nullptr;
+TextBlock g_flyoutRefreshLabel = nullptr;
+ProgressBar g_flyoutProgressBar = nullptr;
+StackPanel g_flyoutDeviceList = nullptr;
+std::vector<DeviceRow> g_deviceRows;
+bool g_flyoutVisible = false;
+bool g_flyoutRefreshing = false;
+ULONGLONG g_flyoutHiddenTick = 0; // guards against reopening on the click that just closed it
+
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
 std::mutex g_connectionsMutex; // Protects g_audioPlaybackConnections
 HICON g_hIconLight = nullptr;

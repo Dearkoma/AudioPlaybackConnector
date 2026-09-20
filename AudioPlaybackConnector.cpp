@@ -4,6 +4,9 @@
 #include <stdarg.h>
 #include <strsafe.h>
 
+#include <algorithm>
+#include <cmath>
+
 // Posted with WM_CONNECTION_CLOSED: the device id of the connection that
 // closed, plus the AudioPlaybackConnection instance that actually closed.
 // WM_CONNECTION_CLOSED compares this against the current map entry so a stale
@@ -93,26 +96,26 @@ enum : UINT
 	IDM_EXIT,
 };
 
-// SetDisplayStatus may be called by a ConnectDevice coroutine after the picker
-// was dismissed and its island torn down (g_devicePicker can be null); swallow
-// any failure so a stale status update can never crash the app.
-void SafeSetDisplayStatus(DevicePicker const& picker, DeviceInformation const& device, winrt::param::hstring const& status, DevicePickerDisplayStatusOptions options)
-{
-	try { if (picker) picker.SetDisplayStatus(device, status, options); } catch (...) {}
-}
-
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
-winrt::fire_and_forget ConnectDevice(DevicePicker, std::wstring_view);
-winrt::fire_and_forget ConnectDevice(DevicePicker, DeviceInformation);
+LRESULT CALLBACK FlyoutWndProc(HWND, UINT, WPARAM, LPARAM);
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId);
+winrt::fire_and_forget ConnectDevice(DeviceInformation device);
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void DisconnectAllDevices();
+void DisconnectDevice(std::wstring const& deviceId);
 winrt::fire_and_forget RestoreAudioService();
 winrt::fire_and_forget ReconnectDevices(std::vector<std::wstring> deviceIds);
 void RebuildUi();
-void CreateIsland();
-void DestroyIsland();
-void ShowDevicePicker(Rect);
+void CreateFlyout();
+void DestroyFlyout();
+void HideDeviceFlyout();
+void ShowDeviceFlyout();
+winrt::fire_and_forget RefreshDeviceList();
+void ApplyFlyoutTexts();
+void UpdateFlyoutSubtitle();
+void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status, DeviceAction action);
+bool IsSystemLightTheme();
 HMENU BuildPopupMenu();
 void HandleMenuCommand(int cmd);
 
@@ -169,9 +172,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	FAIL_FAST_IF_WIN32_BOOL_FALSE(SetLayeredWindowAttributes(g_hWnd, 0, 0, LWA_ALPHA));
 
 	// No XAML island is created at startup: the tray menu is a plain Win32
-	// popup menu, and the island (hosting the DevicePicker) is created on
-	// demand only while the picker is open, then torn down when it dismisses.
-	// This avoids keeping a DirectComposition surface alive in the background.
+	// popup menu, and the device flyout (with its own island) is created on
+	// first use. Unlike the system picker it replaced, the flyout window and
+	// tree are then kept alive while hidden, so connection state survives
+	// between opens instead of being rebuilt from scratch every time.
 	LoadSettings();
 	ReloadTranslations();
 	SetupSvgIcon();
@@ -189,9 +193,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	while (GetMessageW(&msg, nullptr, 0, 0))
 	{
 		BOOL processed = FALSE;
-		if (g_desktopSourceNative2)
+		if (g_flyoutSourceNative2)
 		{
-			winrt::check_hresult(g_desktopSourceNative2->PreTranslateMessage(&msg, &processed));
+			winrt::check_hresult(g_flyoutSourceNative2->PreTranslateMessage(&msg, &processed));
 		}
 		if (!processed)
 		{
@@ -214,7 +218,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// touching resources we are about to release.
 		g_shuttingDown = true;
 		LogEvent(L"Application exiting");
-		DestroyIsland();
+		DestroyFlyout();
 
 		// Save settings while we still have the connection list intact
 		SaveSettings();
@@ -228,7 +232,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			for (auto& pair : g_audioPlaybackConnections)
 			{
 				pair.second.second.Close();
-				if (g_devicePicker) g_devicePicker.SetDisplayStatus(pair.second.first, {}, DevicePickerDisplayStatusOptions::None);
 			}
 			g_audioPlaybackConnections.clear();
 		}
@@ -257,23 +260,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case NIN_SELECT:
 		case NIN_KEYSELECT:
 		{
-			RECT iconRect;
-			auto hr = Shell_NotifyIconGetRect(&g_niid, &iconRect);
-			if (FAILED(hr))
+			// A click on the tray icon toggles the flyout. Showing it steals
+			// focus, so the next click deactivates it (light dismiss) before
+			// this handler runs — hence the "just closed" check, which turns
+			// that click into a close instead of an immediate reopen.
+			const bool justClosed = g_flyoutHiddenTick != 0 && GetTickCount64() - g_flyoutHiddenTick < 300;
+			if (g_flyoutVisible || justClosed)
 			{
-				LOG_HR(hr);
-				break;
+				HideDeviceFlyout();
 			}
-
-			auto dpi = GetDpiForWindow(hWnd);
-			Rect rect = {
-				static_cast<float>(iconRect.left * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>(iconRect.top * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.right - iconRect.left) * USER_DEFAULT_SCREEN_DPI / dpi),
-				static_cast<float>((iconRect.bottom - iconRect.top) * USER_DEFAULT_SCREEN_DPI / dpi)
-			};
-
-			ShowDevicePicker(rect);
+			else
+			{
+				ShowDeviceFlyout();
+			}
 		}
 		break;
 		case WM_CONTEXTMENU:
@@ -311,16 +310,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// It posts this message so all XAML UI updates and map mutations happen
 		// on the main UI thread, avoiding cross-thread races.
 		std::unique_ptr<ConnectionClosedInfo> info(reinterpret_cast<ConnectionClosedInfo*>(wParam));
-		std::lock_guard<std::mutex> lock(g_connectionsMutex);
-		auto it = g_audioPlaybackConnections.find(info->deviceId);
-		// Only remove the entry if the connection that closed is still the one
-		// in the map. A stale message from an earlier connection to the same
-		// device must not drop a newer, still-open connection.
-		if (it != g_audioPlaybackConnections.end() && it->second.second == info->connection)
+		std::wstring closedDeviceId;
 		{
-			if (g_devicePicker) g_devicePicker.SetDisplayStatus(it->second.first, {}, DevicePickerDisplayStatusOptions::None);
-			LogEvent(L"Disconnected: %s", it->second.first.Name().c_str());
-			g_audioPlaybackConnections.erase(it);
+			std::lock_guard<std::mutex> lock(g_connectionsMutex);
+			auto it = g_audioPlaybackConnections.find(info->deviceId);
+			// Only remove the entry if the connection that closed is still the
+			// one in the map. A stale message from an earlier connection to the
+			// same device must not drop a newer, still-open connection.
+			if (it != g_audioPlaybackConnections.end() && it->second.second == info->connection)
+			{
+				LogEvent(L"Disconnected: %s", it->second.first.Name().c_str());
+				closedDeviceId = it->second.first.Id().c_str();
+				g_audioPlaybackConnections.erase(it);
+			}
+		}
+
+		// Update the flyout outside the lock: calling into XAML while holding
+		// g_connectionsMutex risks a deadlock if a layout pass re-enters.
+		if (!closedDeviceId.empty())
+		{
+			UpdateDeviceStatus(closedDeviceId, _(L"Not connected"), DeviceAction::Connect);
 		}
 		break;
 	}
@@ -334,74 +343,560 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return 0;
 }
 
-void CreateIsland()
+// ── Device flyout (self-drawn) ───────────────────────────────────────
+// The system device picker (Windows.Devices.Enumeration.DevicePicker) can only
+// set a title, a few colors and a per-row status text — it exposes no way to
+// host custom controls, so a refresh indicator and a refresh button cannot live
+// there. The list is therefore drawn by this app: a dedicated popup window
+// hosts its own XAML island.
+//
+// The window and the XAML tree are created on first use and then kept alive
+// (hidden). Rebuilding the tree on every open used to lose all row state; with
+// a persistent tree, connection status survives between opens.
+
+using winrt::Windows::UI::Xaml::Media::SolidColorBrush;
+
+namespace
 {
-	if (g_desktopSource) return;
+	constexpr wchar_t kFlyoutClassName[] = L"AudioPlaybackConnectorFlyout";
+	constexpr float kFlyoutWidthDip = 340.0f;
 
-	g_desktopSource = DesktopWindowXamlSource();
-	g_desktopSourceNative2 = g_desktopSource.as<IDesktopWindowXamlSourceNative2>();
-	winrt::check_hresult(g_desktopSourceNative2->AttachToWindow(g_hWnd));
-	winrt::check_hresult(g_desktopSourceNative2->get_WindowHandle(&g_hWndXaml));
+	// Colors are baked into the XAML instead of using ThemeResource: the island
+	// has no Application object, so theme resources do not reliably resolve.
+	// They follow the system app theme — the same registry value the tray icon
+	// already uses.
+	struct FlyoutPalette
+	{
+		const wchar_t* surface;
+		const wchar_t* border;
+		const wchar_t* textPrimary;
+		const wchar_t* textSecondary;
+		const wchar_t* accent;
+		const wchar_t* track;
+		const wchar_t* connected;
+		const wchar_t* danger;
+	};
 
-	g_xamlCanvas = Canvas();
-	g_desktopSource.Content(g_xamlCanvas);
+	const FlyoutPalette kFlyoutLight = { L"#F9F9F9", L"#E5E5E5", L"#1A1A1A", L"#616161", L"#0078D4", L"#E5E5E5", L"#107C41", L"#C42B1C" };
+	const FlyoutPalette kFlyoutDark = { L"#202020", L"#3A3A3A", L"#FFFFFF", L"#A0A0A0", L"#60CDFF", L"#3A3A3A", L"#6CCB9F", L"#FF99A4" };
 }
 
-void DestroyIsland()
+bool IsSystemLightTheme()
 {
-	g_devicePicker = nullptr;
-	if (g_desktopSource)
+	DWORD value = 0, cbValue = sizeof(value);
+	if (FAILED(RegGetValueW(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &cbValue)))
+	{
+		// Unreadable: assume light, matching the system default.
+		return true;
+	}
+	return value != 0;
+}
+
+FlyoutPalette const& CurrentFlyoutPalette()
+{
+	return IsSystemLightTheme() ? kFlyoutLight : kFlyoutDark;
+}
+
+winrt::Windows::UI::Color ColorFromHex(std::wstring_view hex)
+{
+	auto nibble = [](wchar_t c) -> uint8_t
+	{
+		if (c >= L'0' && c <= L'9') return static_cast<uint8_t>(c - L'0');
+		if (c >= L'a' && c <= L'f') return static_cast<uint8_t>(c - L'a' + 10);
+		if (c >= L'A' && c <= L'F') return static_cast<uint8_t>(c - L'A' + 10);
+		return 0;
+	};
+
+	winrt::Windows::UI::Color color{};
+	color.A = 255;
+	if (hex.size() >= 7 && hex[0] == L'#')
+	{
+		color.R = static_cast<uint8_t>((nibble(hex[1]) << 4) | nibble(hex[2]));
+		color.G = static_cast<uint8_t>((nibble(hex[3]) << 4) | nibble(hex[4]));
+		color.B = static_cast<uint8_t>((nibble(hex[5]) << 4) | nibble(hex[6]));
+	}
+	return color;
+}
+
+SolidColorBrush SolidBrush(std::wstring_view hex)
+{
+	auto brush = SolidColorBrush();
+	brush.Color(ColorFromHex(hex));
+	return brush;
+}
+
+// Layout: header (title + subtitle + refresh button) → refresh indicator →
+// scrolling device list. The indicator sits in a 3px border that stays visible
+// even when idle, so showing/hiding it never shifts the list.
+std::wstring BuildFlyoutXaml(FlyoutPalette const& p)
+{
+	std::wstring xaml = LR"XAML(<Grid xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="{{SURFACE}}">
+  <Grid.RowDefinitions>
+    <RowDefinition Height="Auto"/>
+    <RowDefinition Height="Auto"/>
+    <RowDefinition Height="Auto"/>
+  </Grid.RowDefinitions>
+  <Grid Grid.Row="0" Padding="14,10,10,10">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="Auto"/>
+    </Grid.ColumnDefinitions>
+    <StackPanel Grid.Column="0" VerticalAlignment="Center">
+      <TextBlock x:Name="TitleText" FontSize="14" FontWeight="SemiBold" Foreground="{{TEXT_PRIMARY}}" TextTrimming="CharacterEllipsis"/>
+      <TextBlock x:Name="SubtitleText" FontSize="12" Margin="0,3,0,0" Foreground="{{TEXT_SECONDARY}}" TextTrimming="CharacterEllipsis"/>
+    </StackPanel>
+    <Button x:Name="RefreshButton" Grid.Column="1" VerticalAlignment="Center" Padding="10,4,10,5">
+      <StackPanel Orientation="Horizontal" Spacing="6">
+        <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE72C;" FontSize="12"/>
+        <TextBlock x:Name="RefreshLabel" FontSize="12" VerticalAlignment="Center"/>
+      </StackPanel>
+    </Button>
+  </Grid>
+  <Border Grid.Row="1" Height="3" Background="{{TRACK}}">
+    <ProgressBar x:Name="RefreshProgress" IsIndeterminate="True" Minimum="0" Maximum="100" Height="3"
+                 Background="Transparent" Foreground="{{ACCENT}}" BorderThickness="0" Padding="0"
+                 HorizontalAlignment="Stretch" VerticalAlignment="Stretch"/>
+  </Border>
+  <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollMode="Disabled" MaxHeight="392" Padding="0,0,0,6">
+    <StackPanel x:Name="DeviceList"/>
+  </ScrollViewer>
+</Grid>)XAML";
+
+	auto replace = [&xaml](std::wstring_view token, std::wstring_view value)
+	{
+		for (size_t pos = xaml.find(token); pos != std::wstring::npos; pos = xaml.find(token, pos + value.size()))
+		{
+			xaml.replace(pos, token.size(), value);
+		}
+	};
+
+	replace(L"{{SURFACE}}", p.surface);
+	replace(L"{{TEXT_PRIMARY}}", p.textPrimary);
+	replace(L"{{TEXT_SECONDARY}}", p.textSecondary);
+	replace(L"{{ACCENT}}", p.accent);
+	replace(L"{{TRACK}}", p.track);
+
+	return xaml;
+}
+
+void ApplyFlyoutTexts()
+{
+	if (!g_flyoutRoot) return;
+
+	try
+	{
+		if (g_flyoutTitle) g_flyoutTitle.Text(_(L"Bluetooth Audio Devices"));
+		if (g_flyoutRefreshLabel) g_flyoutRefreshLabel.Text(_(L"Refresh"));
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+
+	UpdateFlyoutSubtitle();
+}
+
+void UpdateFlyoutSubtitle()
+{
+	if (!g_flyoutRoot || !g_flyoutSubtitle) return;
+
+	try
+	{
+		if (g_flyoutRefreshing)
+		{
+			g_flyoutSubtitle.Text(_(L"Checking connection status"));
+			return;
+		}
+
+		unsigned connected = 0;
+		for (auto const& row : g_deviceRows)
+		{
+			if (row.state && row.state->action == DeviceAction::Disconnect)
+			{
+				++connected;
+			}
+		}
+
+		wchar_t text[64];
+		swprintf(text, ARRAYSIZE(text), _(L"%d connected"), static_cast<int>(connected));
+		g_flyoutSubtitle.Text(text);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+}
+
+void SetFlyoutRefreshing(bool refreshing)
+{
+	g_flyoutRefreshing = refreshing;
+
+	if (g_flyoutRoot)
 	{
 		try
 		{
-			g_desktopSource.Content(nullptr);
+			if (g_flyoutProgressBar) g_flyoutProgressBar.Visibility(refreshing ? Visibility::Visible : Visibility::Collapsed);
+			if (g_flyoutRefreshButton) g_flyoutRefreshButton.IsEnabled(!refreshing);
+		}
+		catch (winrt::hresult_error const&)
+		{
+			LOG_CAUGHT_EXCEPTION();
+		}
+	}
+
+	UpdateFlyoutSubtitle();
+}
+
+winrt::hstring ActionLabel(DeviceAction action)
+{
+	switch (action)
+	{
+	case DeviceAction::Disconnect: return _(L"Disconnect");
+	case DeviceAction::Retry: return _(L"Retry");
+	case DeviceAction::Connect: return _(L"Connect");
+	default: return {};
+	}
+}
+
+SolidColorBrush StatusBrush(DeviceAction action)
+{
+	auto const& palette = CurrentFlyoutPalette();
+	switch (action)
+	{
+	case DeviceAction::Disconnect: return SolidBrush(palette.connected);
+	case DeviceAction::Retry: return SolidBrush(palette.danger);
+	default: return SolidBrush(palette.textSecondary);
+	}
+}
+
+// Reads the authoritative connection state of a device. Some Bluetooth
+// adapters do not report the property at all; the callers fall back to the
+// app's own connection map in that case.
+bool IsDeviceConnected(DeviceInformation const& device)
+{
+	try
+	{
+		auto properties = device.Properties();
+		if (properties && properties.HasKey(L"System.Devices.Aep.IsConnected"))
+		{
+			return winrt::unbox_value_or<bool>(properties.Lookup(L"System.Devices.Aep.IsConnected"), false);
+		}
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+	return false;
+}
+
+void AppendDeviceRow(DeviceInformation const& device, bool connected)
+{
+	auto const& palette = CurrentFlyoutPalette();
+
+	auto nameText = TextBlock();
+	nameText.FontSize(13);
+	nameText.FontWeight(winrt::Windows::UI::Text::FontWeights::SemiBold());
+	nameText.Foreground(SolidBrush(palette.textPrimary));
+	nameText.TextTrimming(TextTrimming::CharacterEllipsis);
+	nameText.Text(device.Name());
+
+	auto statusText = TextBlock();
+	statusText.FontSize(12);
+	statusText.Margin(Thickness{ 0, 3, 0, 0 });
+	statusText.TextTrimming(TextTrimming::CharacterEllipsis);
+	statusText.Foreground(StatusBrush(connected ? DeviceAction::Disconnect : DeviceAction::Connect));
+	statusText.Text(connected ? _(L"Connected") : _(L"Not connected"));
+
+	auto textPanel = StackPanel();
+	textPanel.VerticalAlignment(VerticalAlignment::Center);
+	textPanel.Children().Append(nameText);
+	textPanel.Children().Append(statusText);
+
+	// The click handler captures only this shared state, so updating a row's
+	// action later (connect → disconnect, or an error → retry) does not require
+	// rebuilding the row.
+	auto state = std::make_shared<DeviceRowState>();
+	state->deviceId = std::wstring(device.Id());
+	state->action = connected ? DeviceAction::Disconnect : DeviceAction::Connect;
+
+	auto actionButton = Button();
+	actionButton.FontSize(12);
+	actionButton.Padding(Thickness{ 12, 4, 12, 5 });
+	actionButton.MinWidth(76);
+	actionButton.VerticalAlignment(VerticalAlignment::Center);
+	actionButton.Content(winrt::box_value(ActionLabel(state->action)));
+	actionButton.Click([state](auto&&, auto&&)
+	{
+		switch (state->action)
+		{
+		case DeviceAction::Disconnect:
+			DisconnectDevice(state->deviceId);
+			break;
+		case DeviceAction::Connect:
+		case DeviceAction::Retry:
+			ConnectDevice(state->deviceId);
+			break;
+		default:
+			break;
+		}
+	});
+
+	auto row = Grid();
+	row.Padding(Thickness{ 14, 9, 14, 9 });
+
+	auto nameColumn = ColumnDefinition();
+	nameColumn.Width(GridLength{ 1.0, GridUnitType::Star });
+	auto actionColumn = ColumnDefinition();
+	actionColumn.Width(GridLength{ 0.0, GridUnitType::Auto });
+	row.ColumnDefinitions().Append(nameColumn);
+	row.ColumnDefinitions().Append(actionColumn);
+
+	Grid::SetColumn(textPanel, 0);
+	Grid::SetColumn(actionButton, 1);
+	row.Children().Append(textPanel);
+	row.Children().Append(actionButton);
+
+	auto divider = Border();
+	divider.BorderThickness(Thickness{ 0, 1, 0, 0 });
+	divider.BorderBrush(SolidBrush(palette.border));
+	divider.Child(row);
+
+	g_flyoutDeviceList.Children().Append(divider);
+	g_deviceRows.push_back(DeviceRow{ state->deviceId, statusText, actionButton, state });
+}
+
+void RebuildDeviceRows(std::vector<DeviceInformation> const& devices)
+{
+	std::vector<std::wstring> managed;
+	{
+		std::lock_guard<std::mutex> lock(g_connectionsMutex);
+		managed.reserve(g_audioPlaybackConnections.size());
+		for (auto const& entry : g_audioPlaybackConnections)
+		{
+			managed.push_back(entry.first);
+		}
+	}
+
+	g_flyoutDeviceList.Children().Clear();
+	g_deviceRows.clear();
+
+	auto const& palette = CurrentFlyoutPalette();
+
+	if (devices.empty())
+	{
+		auto emptyText = TextBlock();
+		emptyText.FontSize(12);
+		emptyText.Margin(Thickness{ 14, 12, 14, 12 });
+		emptyText.Foreground(SolidBrush(palette.textSecondary));
+		emptyText.Text(_(L"No devices found"));
+		g_flyoutDeviceList.Children().Append(emptyText);
+		UpdateFlyoutSubtitle();
+		return;
+	}
+
+	// Connected devices first, so the ones in use are always at the top. The
+	// enumeration order is preserved within each group.
+	std::vector<std::pair<bool, DeviceInformation>> rows;
+	rows.reserve(devices.size());
+	for (auto const& device : devices)
+	{
+		const std::wstring deviceId(device.Id());
+		const bool managedDevice = std::find(managed.begin(), managed.end(), deviceId) != managed.end();
+		rows.emplace_back(managedDevice || IsDeviceConnected(device), device);
+	}
+	std::stable_sort(rows.begin(), rows.end(), [](auto const& a, auto const& b) { return a.first && !b.first; });
+
+	for (auto const& entry : rows)
+	{
+		AppendDeviceRow(entry.second, entry.first);
+	}
+
+	UpdateFlyoutSubtitle();
+}
+
+void CreateFlyout()
+{
+	if (g_flyoutRoot) return;
+
+	WNDCLASSEXW wcex = {
+		.cbSize = sizeof(wcex),
+		.lpfnWndProc = FlyoutWndProc,
+		.hInstance = g_hInst,
+		.hCursor = LoadCursorW(nullptr, IDC_ARROW),
+		.lpszClassName = kFlyoutClassName
+	};
+	RegisterClassExW(&wcex); // 0 when already registered — nothing to do
+
+	// No WS_EX_LAYERED here: XAML Islands content does not render inside a
+	// layered window, which is also why the tray window (alpha 0) cannot host
+	// the flyout. WS_EX_TOOLWINDOW keeps it out of Alt+Tab.
+	g_hWndFlyout = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kFlyoutClassName, nullptr, WS_POPUP,
+		0, 0, 10, 10, nullptr, nullptr, g_hInst, nullptr);
+	if (!g_hWndFlyout)
+	{
+		LOG_LAST_ERROR();
+		return;
+	}
+
+	try
+	{
+		g_flyoutSource = DesktopWindowXamlSource();
+		g_flyoutSourceNative2 = g_flyoutSource.as<IDesktopWindowXamlSourceNative2>();
+		winrt::check_hresult(g_flyoutSourceNative2->AttachToWindow(g_hWndFlyout));
+
+		auto root = winrt::Windows::UI::Xaml::Markup::XamlReader::Load(BuildFlyoutXaml(CurrentFlyoutPalette())).as<Grid>();
+		g_flyoutRoot = root;
+		g_flyoutTitle = root.FindName(L"TitleText").as<TextBlock>();
+		g_flyoutSubtitle = root.FindName(L"SubtitleText").as<TextBlock>();
+		g_flyoutRefreshButton = root.FindName(L"RefreshButton").as<Button>();
+		g_flyoutRefreshLabel = root.FindName(L"RefreshLabel").as<TextBlock>();
+		g_flyoutProgressBar = root.FindName(L"RefreshProgress").as<ProgressBar>();
+		g_flyoutDeviceList = root.FindName(L"DeviceList").as<StackPanel>();
+
+		g_flyoutRefreshButton.Click([](auto&&, auto&&) { RefreshDeviceList(); });
+
+		g_flyoutSource.Content(root);
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+		DestroyFlyout();
+		return;
+	}
+
+	ApplyFlyoutTexts();
+	SetFlyoutRefreshing(false);
+}
+
+void DestroyFlyout()
+{
+	g_flyoutVisible = false;
+	g_deviceRows.clear();
+	g_flyoutDeviceList = nullptr;
+	g_flyoutProgressBar = nullptr;
+	g_flyoutRefreshLabel = nullptr;
+	g_flyoutRefreshButton = nullptr;
+	g_flyoutSubtitle = nullptr;
+	g_flyoutTitle = nullptr;
+	g_flyoutRoot = nullptr;
+
+	if (g_flyoutSource)
+	{
+		try
+		{
+			g_flyoutSource.Content(nullptr);
 		}
 		catch (...)
 		{
 			// The island may already be partially torn down; never let
 			// teardown crash the app.
 		}
-		g_desktopSource = nullptr;
+		g_flyoutSource = nullptr;
 	}
-	g_desktopSourceNative2 = nullptr;
-	g_hWndXaml = nullptr;
-	g_xamlCanvas = nullptr;
+	g_flyoutSourceNative2 = nullptr;
+
+	if (g_hWndFlyout)
+	{
+		DestroyWindow(g_hWndFlyout);
+		g_hWndFlyout = nullptr;
+	}
 }
 
-// Refreshes the connection state of every device in the picker. Called right
-// after the picker is shown: the picker object is recreated on each open, so
-// any display status set during a previous session is lost — without this an
-// already-connected device would look disconnected and offer no way to
-// disconnect it.
-//
-// Pass 1 is synchronous and instant: whatever this process is managing is
-// marked immediately. Pass 2 is authoritative: it asks the system which A2DP
-// devices are actually connected, covering links established outside this app
-// (e.g. from Windows Settings).
-winrt::fire_and_forget RefreshDeviceConnectionStates(DevicePicker picker)
+void HideDeviceFlyout()
 {
-	if (!picker) co_return;
+	if (!g_flyoutVisible) return;
 
-	// Collect under the lock, but never call into XAML while holding it.
-	std::vector<DeviceInformation> managedDevices;
+	g_flyoutVisible = false;
+	// Remember when the flyout went away: the click that closes it must not be
+	// mistaken for a click that opens it again.
+	g_flyoutHiddenTick = GetTickCount64();
+
+	if (g_hWndFlyout)
+	{
+		ShowWindow(g_hWndFlyout, SW_HIDE);
+	}
+}
+
+LRESULT CALLBACK FlyoutWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	switch (message)
+	{
+	case WM_ACTIVATE:
+		if (LOWORD(wParam) == WA_INACTIVE)
+		{
+			// Light dismiss: hide as soon as focus moves anywhere else.
+			HideDeviceFlyout();
+		}
+		break;
+	case WM_CLOSE:
+		HideDeviceFlyout();
+		return 0;
+	}
+	return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+void ShowDeviceFlyout()
+{
+	CreateFlyout();
+	if (!g_flyoutRoot) return;
+
 	try
 	{
-		std::lock_guard<std::mutex> lock(g_connectionsMutex);
-		managedDevices.reserve(g_audioPlaybackConnections.size());
-		for (auto const& entry : g_audioPlaybackConnections)
+		ApplyFlyoutTexts();
+
+		UINT dpi = GetDpiForWindow(g_hWndFlyout);
+		if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
+
+		// Measure with a fixed width constraint to get the natural content
+		// height. The width is fixed by the DIP constant, and the list is
+		// capped by the ScrollViewer's MaxHeight, so the result is stable.
+		g_flyoutRoot.Measure(Size{ kFlyoutWidthDip, 4000.0f });
+		auto desired = g_flyoutRoot.DesiredSize();
+
+		const int width = MulDiv(static_cast<int>(kFlyoutWidthDip), dpi, USER_DEFAULT_SCREEN_DPI);
+		int height = static_cast<int>(std::lround(desired.Height * dpi / USER_DEFAULT_SCREEN_DPI));
+		height = std::clamp(height, MulDiv(96, dpi, USER_DEFAULT_SCREEN_DPI), MulDiv(560, dpi, USER_DEFAULT_SCREEN_DPI));
+
+		// Anchor to the tray icon: above it and right-aligned, like a tray flyout.
+		RECT icon{};
+		if (FAILED(Shell_NotifyIconGetRect(&g_niid, &icon)))
 		{
-			managedDevices.push_back(entry.second.first);
+			LOG_LAST_ERROR();
+			POINT cursor{};
+			GetCursorPos(&cursor);
+			icon = { cursor.x, cursor.y, cursor.x + 1, cursor.y + 1 };
 		}
+
+		int x = icon.right - width;
+		int y = icon.top - height - MulDiv(8, dpi, USER_DEFAULT_SCREEN_DPI);
+
+		MONITORINFO monitor{ sizeof(monitor) };
+		if (GetMonitorInfoW(MonitorFromRect(&icon, MONITOR_DEFAULTTONEAREST), &monitor))
+		{
+			const RECT& work = monitor.rcWork;
+			x = std::clamp(x, static_cast<int>(work.left), std::max(static_cast<int>(work.left), static_cast<int>(work.right) - width));
+			y = std::clamp(y, static_cast<int>(work.top), std::max(static_cast<int>(work.top), static_cast<int>(work.bottom) - height));
+		}
+
+		SetWindowPos(g_hWndFlyout, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
+		SetForegroundWindow(g_hWndFlyout);
+		g_flyoutVisible = true;
+
+		// Detect the connection state of every device in the list, so an
+		// already-connected device is shown as connected.
+		RefreshDeviceList();
 	}
-	catch (...)
+	catch (winrt::hresult_error const&)
 	{
 		LOG_CAUGHT_EXCEPTION();
 	}
+}
 
-	for (auto const& device : managedDevices)
-	{
-		SafeSetDisplayStatus(picker, device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-	}
+winrt::fire_and_forget RefreshDeviceList()
+{
+	if (!g_flyoutRoot) co_return;
+
+	SetFlyoutRefreshing(true);
 
 	try
 	{
@@ -412,125 +907,102 @@ winrt::fire_and_forget RefreshDeviceConnectionStates(DevicePicker picker)
 
 		if (g_shuttingDown) co_return;
 
+		std::vector<DeviceInformation> list;
+		list.reserve(devices.Size());
 		for (auto const& device : devices)
 		{
-			bool isConnected = false;
-			if (auto properties = device.Properties(); properties.HasKey(L"System.Devices.Aep.IsConnected"))
-			{
-				isConnected = winrt::unbox_value_or<bool>(properties.Lookup(L"System.Devices.Aep.IsConnected"), false);
-			}
-
-			bool managed = false;
-			{
-				std::lock_guard<std::mutex> lock(g_connectionsMutex);
-				managed = g_audioPlaybackConnections.find(std::wstring(device.Id())) != g_audioPlaybackConnections.end();
-			}
-
-			if (isConnected || managed)
-			{
-				SafeSetDisplayStatus(picker, device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
-			}
-			else
-			{
-				// Not connected: clear any stale status left on the list entry.
-				SafeSetDisplayStatus(picker, device, {}, DevicePickerDisplayStatusOptions::None);
-			}
+			list.push_back(device);
 		}
+
+		RebuildDeviceRows(list);
 	}
 	catch (winrt::hresult_error const&)
 	{
-		// Enumeration can fail (no radio, session issues). Pass 1 is already on
-		// screen, so the picker stays usable — just log and move on.
+		// Enumeration can fail (no radio, session issues). Leave whatever is
+		// already on screen and just stop the indicator.
 		LOG_CAUGHT_EXCEPTION();
 	}
 	catch (...)
 	{
 	}
+
+	if (g_shuttingDown) co_return;
+	SetFlyoutRefreshing(false);
 }
 
-void ShowDevicePicker(Rect rect)
+void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status, DeviceAction action)
 {
-	// The picker needs the host window visible/foreground; size it full screen
-	// (layered alpha-0 => invisible) so XAML DPI is correct. It is restored to
-	// 1x1, hidden, non-topmost when the picker closes. The island itself is
-	// created lazily on first use and then kept alive (hidden) — recreating a
-	// DesktopWindowXamlSource on the same host window proved crash-prone.
-	SetWindowPos(g_hWnd, HWND_TOPMOST, 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), SWP_SHOWWINDOW);
-	SetForegroundWindow(g_hWnd);
-
-	try
+	if (g_flyoutRoot)
 	{
-		CreateIsland();
-
-		g_devicePicker = DevicePicker();
-		winrt::check_hresult(g_devicePicker.as<IInitializeWithWindow>()->Initialize(g_hWnd));
-
-		g_devicePicker.Filter().SupportedDeviceSelectors().Append(AudioPlaybackConnection::GetDeviceSelector());
-		g_devicePicker.DevicePickerDismissed([](const auto&, const auto&) {
-			// Null the global picker (in-flight coroutines keep their own copy)
-			// and restore the tiny hidden non-topmost window. The island itself
-			// is kept alive (created lazily on first use): recreating a
-			// DesktopWindowXamlSource on the same host window on repeated opens
-			// proved crash-prone.
-			g_devicePicker = nullptr;
-			SetWindowPos(g_hWnd, HWND_NOTOPMOST, 0, 0, 1, 1, SWP_NOZORDER | SWP_HIDEWINDOW);
-		});
-		g_devicePicker.DeviceSelected([](const auto& sender, const auto& args) {
-			ConnectDevice(sender, args.SelectedDevice());
-		});
-		g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
-			auto device = args.Device();
-			bool closed = false;
+		try
+		{
+			for (auto& row : g_deviceRows)
 			{
-				std::lock_guard<std::mutex> lock(g_connectionsMutex);
-				auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-				if (it != g_audioPlaybackConnections.end())
+				if (std::wstring_view(row.deviceId) != deviceId) continue;
+
+				if (row.state)
 				{
-					it->second.second.Close();
-					g_audioPlaybackConnections.erase(it);
-					closed = true;
-					// StateChanged → WM_CONNECTION_CLOSED handles async
-					// endpoint cleanup on the UI thread.
+					row.state->action = action;
 				}
+				if (row.statusText)
+				{
+					row.statusText.Text(status);
+					row.statusText.Foreground(StatusBrush(action));
+				}
+				if (row.actionButton)
+				{
+					row.actionButton.Content(winrt::box_value(ActionLabel(action)));
+					row.actionButton.IsEnabled(action != DeviceAction::None);
+				}
+				break;
 			}
-
-			if (!closed)
-			{
-				// The link was established outside this app (for example from
-				// Windows Settings), so it is not in our map. Create a
-				// throwaway connection object for the device and close it so
-				// the disconnect button still does something.
-				try
-				{
-					if (auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id()))
-					{
-						connection.Close();
-						LogEvent(L"Disconnect (external link): %s", device.Name().c_str());
-					}
-				}
-				catch (winrt::hresult_error const&)
-				{
-					LOG_CAUGHT_EXCEPTION();
-				}
-			}
-
-			SafeSetDisplayStatus(sender, device, {}, DevicePickerDisplayStatusOptions::None);
-		});
-
-		using namespace winrt::Windows::UI::Popups;
-		g_devicePicker.Show(rect, Placement::Above);
-
-		// Detect the connection state of every device in the list, so an
-		// already-connected device is shown as connected (left-click refresh).
-		RefreshDeviceConnectionStates(g_devicePicker);
+		}
+		catch (winrt::hresult_error const&)
+		{
+			// A stale status update from a coroutine must never crash the app.
+			LOG_CAUGHT_EXCEPTION();
+		}
 	}
-	catch (winrt::hresult_error const&)
+
+	UpdateFlyoutSubtitle();
+}
+
+void DisconnectDevice(std::wstring const& deviceId)
+{
+	bool closed = false;
 	{
-		// Picker failed to open — clean up and restore the hidden window.
-		LOG_CAUGHT_EXCEPTION();
-		DestroyIsland();
-		SetWindowPos(g_hWnd, HWND_NOTOPMOST, 0, 0, 1, 1, SWP_NOZORDER | SWP_HIDEWINDOW);
+		std::lock_guard<std::mutex> lock(g_connectionsMutex);
+		auto it = g_audioPlaybackConnections.find(deviceId);
+		if (it != g_audioPlaybackConnections.end())
+		{
+			it->second.second.Close();
+			g_audioPlaybackConnections.erase(it);
+			closed = true;
+			// StateChanged → WM_CONNECTION_CLOSED handles async endpoint
+			// cleanup on the UI thread.
+		}
 	}
+
+	if (!closed)
+	{
+		// The link was established outside this app (for example from Windows
+		// Settings), so it is not in our map. Create a throwaway connection
+		// object for the device and close it so the button still does something.
+		try
+		{
+			if (auto connection = AudioPlaybackConnection::TryCreateFromId(deviceId))
+			{
+				connection.Close();
+				LogEvent(L"Disconnect (external link): %s", deviceId.c_str());
+			}
+		}
+		catch (winrt::hresult_error const&)
+		{
+			LOG_CAUGHT_EXCEPTION();
+		}
+	}
+
+	UpdateDeviceStatus(deviceId, _(L"Not connected"), DeviceAction::Connect);
 }
 
 void ShowExitConfirmation()
@@ -627,20 +1099,29 @@ void HandleMenuCommand(int cmd)
 void RebuildUi()
 {
 	// Reload the translation maps for the newly selected language. The Win32
-	// popup menu is rebuilt from _() strings on every open, so no persistent
-	// XAML UI needs reconstructing here.
+	// popup menu is rebuilt from _() strings on every open. The flyout tree is
+	// persistent (unlike the picker it replaced), so its fixed labels and its
+	// device rows are re-created here as well.
 	ReloadTranslations();
 	wcscpy_s(g_nid.szTip, _(L"AudioPlaybackConnector"));
 	UpdateNotifyIcon();
+
+	if (g_flyoutRoot)
+	{
+		ApplyFlyoutTexts();
+		RefreshDeviceList();
+	}
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation device)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	if (g_shuttingDown) co_return;
 
 	LogEvent(L"Connecting: %s", device.Name().c_str());
 
-	SafeSetDisplayStatus(picker, device, _(L"Connecting"), DevicePickerDisplayStatusOptions::ShowProgress | DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	// Disable the row's button while the request is in flight so a second
+	// click cannot start a competing connection to the same device.
+	UpdateDeviceStatus(device.Id(), _(L"Connecting"), DeviceAction::None);
 
 	bool success = false;
 	std::wstring errorMessage;
@@ -727,7 +1208,7 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 
 	if (success)
 	{
-		SafeSetDisplayStatus(picker, device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+		UpdateDeviceStatus(device.Id(), _(L"Connected"), DeviceAction::Disconnect);
 		LogEvent(L"Connected: %s", device.Name().c_str());
 	}
 	else
@@ -745,17 +1226,17 @@ winrt::fire_and_forget ConnectDevice(DevicePicker picker, DeviceInformation devi
 			}
 		}
 		LogEvent(L"Connect failed: %s  (%s)", device.Name().c_str(), errorMessage.c_str());
-		SafeSetDisplayStatus(picker, device, errorMessage, DevicePickerDisplayStatusOptions::ShowRetryButton);
+		UpdateDeviceStatus(device.Id(), errorMessage, DeviceAction::Retry);
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DevicePicker picker, std::wstring_view deviceId)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
 	if (g_shuttingDown) co_return;
 
 	auto device = co_await DeviceInformation::CreateFromIdAsync(deviceId);
 	if (g_shuttingDown) co_return;
-	ConnectDevice(picker, device);
+	ConnectDevice(device);
 }
 
 void SetupSvgIcon()
@@ -781,9 +1262,8 @@ void SetupSvgIcon()
 
 void UpdateNotifyIcon()
 {
-	DWORD value = 0, cbValue = sizeof(value);
-	LOG_IF_WIN32_ERROR(RegGetValueW(HKEY_CURRENT_USER, LR"(Software\Microsoft\Windows\CurrentVersion\Themes\Personalize)", L"SystemUsesLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &cbValue));
-	g_nid.hIcon = value != 0 ? g_hIconLight : g_hIconDark;
+	// Same registry value the flyout palette uses (see IsSystemLightTheme).
+	g_nid.hIcon = IsSystemLightTheme() ? g_hIconLight : g_hIconDark;
 
 	if (!Shell_NotifyIconW(NIM_MODIFY, &g_nid))
 	{
@@ -800,6 +1280,7 @@ void UpdateNotifyIcon()
 
 void DisconnectAllDevices()
 {
+	std::vector<std::wstring> closedIds;
 	{
 		std::lock_guard<std::mutex> lock(g_connectionsMutex);
 		if (g_audioPlaybackConnections.empty())
@@ -811,13 +1292,20 @@ void DisconnectAllDevices()
 		// handles async endpoint cleanup on the UI thread. We clear the map
 		// immediately — pending WM_CONNECTION_CLOSED messages will find
 		// nothing, which is harmless.
+		closedIds.reserve(g_audioPlaybackConnections.size());
 		for (auto& pair : g_audioPlaybackConnections)
 		{
+			closedIds.push_back(pair.first);
 			pair.second.second.Close();
-			if (g_devicePicker) g_devicePicker.SetDisplayStatus(pair.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
 
 		g_audioPlaybackConnections.clear();
+	}
+
+	// Rows are updated after the lock is released — see WM_CONNECTION_CLOSED.
+	for (auto const& id : closedIds)
+	{
+		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}
 
 	LogEvent(L"Disconnect All: closed all connections");
@@ -862,9 +1350,13 @@ winrt::fire_and_forget RestoreAudioService()
 		{
 			deviceIds.push_back(pair.first);
 			pair.second.second.Close();
-			if (g_devicePicker) g_devicePicker.SetDisplayStatus(pair.second.first, {}, DevicePickerDisplayStatusOptions::None);
 		}
 		g_audioPlaybackConnections.clear();
+	}
+
+	for (auto const& id : deviceIds)
+	{
+		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}
 
 	LogEvent(L"Restart Bluetooth Audio: closed %zu connection(s), reconnecting", deviceIds.size());
@@ -883,7 +1375,7 @@ winrt::fire_and_forget RestoreAudioService()
 	// both Bluetooth quality and 2.4 GHz Wi-Fi coexistence.
 	for (const auto& id : deviceIds)
 	{
-		ConnectDevice(g_devicePicker, id);
+		ConnectDevice(id);
 		co_await winrt::resume_after(std::chrono::milliseconds(500));
 	}
 }
@@ -897,7 +1389,7 @@ winrt::fire_and_forget ReconnectDevices(std::vector<std::wstring> deviceIds)
 	for (const auto& id : deviceIds)
 	{
 		if (g_shuttingDown) co_return;
-		ConnectDevice(g_devicePicker, id);
+		ConnectDevice(id);
 		co_await winrt::resume_after(std::chrono::milliseconds(500));
 	}
 }

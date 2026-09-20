@@ -35,6 +35,17 @@ void BuildChineseMap()
 	hashToStrMap.emplace(H(L"Connected"), L"已连接");
 	hashToStrMap.emplace(H(L"All Devices Disconnected"), L"所有设备已断开");
 	hashToStrMap.emplace(H(L"All Bluetooth audio connections have been closed.\n\nYou can now reconnect your devices."), L"所有蓝牙音频连接已关闭。\n\n现在可以重新连接设备。");
+
+	// ── Self-drawn device flyout ─────────────────────────────────
+	hashToStrMap.emplace(H(L"Bluetooth Audio Devices"), L"蓝牙音频设备");
+	hashToStrMap.emplace(H(L"%d connected"), L"%d 台已连接");
+	hashToStrMap.emplace(H(L"Checking connection status"), L"正在检测连接状态");
+	hashToStrMap.emplace(H(L"No devices found"), L"未找到设备");
+	hashToStrMap.emplace(H(L"Not connected"), L"未连接");
+	hashToStrMap.emplace(H(L"Connect"), L"连接");
+	hashToStrMap.emplace(H(L"Disconnect"), L"断开");
+	hashToStrMap.emplace(H(L"Retry"), L"重试");
+	hashToStrMap.emplace(H(L"Refresh"), L"刷新");
 	hashToStrMap.emplace(H(L"This will disconnect and reconnect the audio connections managed by AudioPlaybackConnector.\n\n"
 	                      L"No system services are touched — only this app's own connections are affected.\n"
 	                      L"Other Bluetooth devices (mouse, keyboard, etc.) will NOT be interrupted.\n\n"
