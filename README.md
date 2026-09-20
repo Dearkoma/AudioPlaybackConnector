@@ -67,7 +67,7 @@ the device flyout (with its own island) is built on the first left click.
 
 Tray icon left click → ShowDeviceFlyout()
   ├─ CreateFlyout()                   // once: popup window + island + XAML tree
-  ├─ Measure, clamp height, anchor above the tray icon
+  ├─ Height from fixed metrics, anchor above the tray icon
   ├─ SetWindowPos(SWP_SHOWWINDOW)     // g_flyoutVisible = true
   └─ RefreshDeviceList()              // asynchronous
 
@@ -81,19 +81,53 @@ RefreshDeviceList() [fire_and_forget]
 Row button click → ConnectDevice() / DisconnectDevice()
 ConnectDevice(DeviceInformation) [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // row updated in place, button disabled
+  ├─ Wait out the reconnect cooldown  // see "Connection Ownership" below
   ├─ AudioPlaybackConnection::TryCreateFromId()
-  ├─ Register StateChanged callback   // → PostMessage(WM_CONNECTION_CLOSED)
-  ├─ connection.StartAsync()          // suspend & wait
-  ├─ connection.OpenAsync()           // suspend & wait
-  └─ On success: UpdateDeviceStatus("Connected", Disconnect)
-     On failure: close + erase from map, UpdateDeviceStatus(error, Retry)
+  ├─ insert_or_assign into the map    // replaces (and closes) any previous entry
+  ├─ Register StateChanged callback   // → WM_CONNECTION_CLOSED / _OPENED
+  ├─ connection.StartAsync()          // suspend & wait — makes the PC a sink
+  ├─ connection.OpenAsync()           // suspend & wait — requests the link
+  └─ On success: State()==Opened → "Connected", otherwise "Connected, no audio"
+                 (StateChanged(Opened) upgrades the row if the sink comes up later)
+     On failure: close ONLY a connection this coroutine owns, then
+                 UpdateDeviceStatus(error, Retry)
+
+StateChanged (OPENED)                 // fires on Bluetooth/audio thread
+  └─ PostMessage(WM_CONNECTION_OPENED) // marshals to UI thread
+WndProc / WM_CONNECTION_OPENED        // UI thread only
+  └─ identity check → UpdateDeviceStatus("Connected", Disconnect)
 
 StateChanged (CLOSED)                 // fires on Bluetooth/audio thread
   └─ PostMessage(WM_CONNECTION_CLOSED) // marshals to UI thread
-
 WndProc / WM_CONNECTION_CLOSED        // UI thread only
-  └─ lock → erase from map → unlock → UpdateDeviceStatus("Not connected", Connect)
+  └─ lock → erase from map (only if the identity matches) → unlock
+     → MarkDeviceClosed → UpdateDeviceStatus("Not connected", Connect)
 ```
+
+### Connection Ownership & the Sink Lifecycle
+
+Everything about letting a phone play through the PC hinges on who keeps the
+`AudioPlaybackConnection` object alive:
+
+- `StartAsync()` is what configures the PC as a **listening A2DP sink**, and that
+  configuration belongs to the object. If the object that opened a link is
+  dropped, the link goes with it.
+- `OpenAsync()` only **requests** the connection. `Success` means the request was
+  accepted, not that audio flows — the connection's own `State()` is the
+  authority, and `State() == Opened` is the only state that means "sound".
+- Because the object *is* the resource, exactly one connection per device may be
+  tracked, and cleanup must never close a connection the caller does not own.
+
+Every rule below exists because breaking it produces the same symptom: the phone
+shows connected on both sides, and nothing comes out of the speakers.
+
+| Rule | Why it matters |
+|------|----------------|
+| The map entry is **replaced** (`insert_or_assign`), never `emplace`d | `emplace` silently keeps the older object, so the new connection dies at the end of the coroutine while the UI keeps claiming the device is connected |
+| Cleanup closes a connection only when its identity matches the map entry | A failure from an older or duplicate attempt must not drop a newer, working connection |
+| A closed device arms a **1.5 s reconnect cooldown** (`g_lastCloseTime`) | Windows needs a moment to release the sink endpoint; reconnecting into an endpoint that is still being torn down yields a link that looks connected but stays silent |
+| A row reads `Connected` only when `State() == Opened`; otherwise `Connected, no audio` | "Linked" and "streaming" are different states, and only the second one produces sound |
+| `WM_CONNECTION_CLOSED` / `WM_CONNECTION_OPENED` carry the connection identity | `StateChanged` fires on a Bluetooth thread; a stale message must never touch a newer connection |
 
 ### Device Flyout
 
@@ -113,7 +147,7 @@ flyout replaces it so the whole surface is under the app's control.
 | Layout | Header (title + "N connected" subtitle + refresh button) → 3px refresh indicator → scrolling device list. The indicator's border stays visible when idle, so toggling it never shifts the list. |
 | Refresh indicator | An indeterminate `ProgressBar` inside a 3px `Border`. Visible only while a refresh is in flight; the refresh button is disabled at the same time, and the subtitle switches to "Checking connection status". |
 | Refresh button | Re-runs `RefreshDeviceList()`, re-querying `System.Devices.Aep.IsConnected`. |
-| Device rows | Name, status text and one action button — *Connect* / *Disconnect* / *Retry* (`None` disables the button while a connect is in flight). Connected devices are sorted first. |
+| Device rows | Name, status text and one action button — *Connect* / *Disconnect* / *Retry* (`None` disables the button while a connect is in flight). Connected devices are sorted first. The status distinguishes *Connected* (audio flowing through this app's connection) from *Connected, no audio* (the device is linked but nothing is streaming), and the button only offers *Disconnect* for a connection this app actually manages — a merely-linked device offers *Connect* instead of leaving the user with no way to get sound. |
 | In-place update | `UpdateDeviceStatus` mutates the existing row's status text, button label, button colour and target action; the list is only rebuilt on a refresh. The click handler captures a `shared_ptr<DeviceRowState>`, so a row's action can be re-targeted (connect → disconnect) without rebuilding it. |
 | Positioning | Anchored above and right-aligned to the tray icon via `Shell_NotifyIconGetRect`, clamped to the nearest monitor's work area. The height is computed from fixed header/row metrics (`FlyoutHeightForRows`) instead of from a `Measure` pass — the island owns the layout of its tree — and is re-applied after every refresh with the bottom edge kept in place. |
 | Dismissal | Light dismiss: the flyout hides on `WM_ACTIVATE`/`WA_INACTIVE`. `g_flyoutHiddenTick` remembers when it closed so the same click that closed it does not immediately reopen it (300 ms guard). |
@@ -136,6 +170,7 @@ flyout replaces it so the whole surface is under the app's control.
 | `g_reconnect` | `bool` | Reconnect on next launch |
 | `g_shuttingDown` | `bool` | Prevent coroutines from touching freed resources on exit |
 | `g_lastDevices` | `vector<wstring>` | Device IDs for auto-reconnect |
+| `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | When each device was last closed — drives the reconnect cooldown |
 
 ### Custom Window Messages
 
@@ -143,13 +178,14 @@ flyout replaces it so the whole surface is under the app's control.
 |---------|---------|
 | `WM_NOTIFYICON` (`WM_APP+1`) | System tray icon clicks, context menu |
 | `WM_CONNECTDEVICE` (`WM_APP+2`) | Auto-reconnect trigger on startup |
-| `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged → UI thread marshal (thread safety) |
+| `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged(Closed) → UI thread marshal (thread safety) |
 | `WM_RUNONUITHREAD` (`WM_APP+4`) | Carries a callable posted by `RunOnUiThread`; the WndProc invokes it on the UI thread |
+| `WM_CONNECTION_OPENED` (`WM_APP+5`) | StateChanged(Opened) → UI thread marshal; this is the moment audio actually starts flowing |
 
 ### Thread Safety (critical invariants)
 
 1. **All XAML object access MUST be on the UI thread.** XAML Islands objects have thread affinity and are not agile. The app runs an STA, so coroutine continuations resume on the UI thread; every XAML-mutating helper additionally re-checks `g_uiThreadId` and re-posts itself through `RunOnUiThread` if it was called from anywhere else. (This only holds because `init_apartment` is given `apartment_type::single_threaded` — its default is MTA, in which case *every* `co_await` continuation lands on a thread pool thread and all XAML updates fail with `RPC_E_WRONG_THREAD`.)
-2. **All `g_audioPlaybackConnections` mutations guarded by `g_connectionsMutex`.** Read or write the map without the lock = data race.
+2. **All `g_audioPlaybackConnections` mutations guarded by `g_connectionsMutex`.** Read or write the map without the lock = data race. `g_lastCloseTime` is guarded by the same mutex, and `IsCurrentConnection()` locks internally — never call it with the lock already held.
 3. **`StateChanged` callback fires on a Bluetooth/audio background thread.** It must NEVER touch XAML or the map directly. It posts `WM_CONNECTION_CLOSED` and the WndProc handler does the work.
 4. **`ConnectDevice` is `fire_and_forget`.** Co-routine resumes happen on the UI thread (STA), so its `UpdateDeviceStatus` calls are safe; the mutex is still held for consistency.
 5. **`g_shuttingDown` checked at coroutine entry points** — prevents use-after-free during exit.

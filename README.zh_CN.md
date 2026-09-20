@@ -67,7 +67,7 @@ wWinMain()
 
 托盘图标左键点击 → ShowDeviceFlyout()
   ├─ CreateFlyout()                   // 仅一次：弹出窗口 + XAML 岛 + XAML 树
-  ├─ 测量内容、钳制高度、对齐到托盘图标上方
+  ├─ 高度由固定指标算出、对齐到托盘图标上方
   ├─ SetWindowPos(SWP_SHOWWINDOW)     // g_flyoutVisible = true
   └─ RefreshDeviceList()              // 异步执行
 
@@ -81,19 +81,45 @@ RefreshDeviceList() [fire_and_forget]
 行内按钮点击 → ConnectDevice() / DisconnectDevice()
 ConnectDevice(DeviceInformation) [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // 原地更新该行，按钮禁用
+  ├─ 先等够重连冷却               // 见下文"连接归属与 sink 生命周期"
   ├─ AudioPlaybackConnection::TryCreateFromId()
-  ├─ 注册 StateChanged 回调         // → PostMessage(WM_CONNECTION_CLOSED)
-  ├─ connection.StartAsync()          // 挂起等待
-  ├─ connection.OpenAsync()           // 挂起等待
-  └─ 成功：UpdateDeviceStatus("Connected", Disconnect)
-     失败：关闭连接、从 map 移除、UpdateDeviceStatus(错误信息, Retry)
+  ├─ insert_or_assign 写入 map        // 若已有旧表项则替换（并关闭旧的）
+  ├─ 注册 StateChanged 回调         // → WM_CONNECTION_CLOSED / _OPENED
+  ├─ connection.StartAsync()          // 挂起等待 —— 让 PC 成为可被连的 sink
+  ├─ connection.OpenAsync()           // 挂起等待 —— 请求建立链路
+  └─ 成功：State()==Opened → "Connected"，否则 "Connected, no audio"
+           （之后若 sink 起来，StateChanged(Opened) 会把该行升级为已连接）
+     失败：只关闭本次协程自己拥有的连接，再 UpdateDeviceStatus(错误信息, Retry)
+
+StateChanged (OPENED 状态)            // 在蓝牙/音频线程触发
+  └─ PostMessage(WM_CONNECTION_OPENED) // 切换到 UI 线程处理
+WndProc / WM_CONNECTION_OPENED        // 仅在 UI 线程执行
+  └─ 校验身份 → UpdateDeviceStatus("Connected", Disconnect)
 
 StateChanged (CLOSED 状态)            // 在蓝牙/音频线程触发
   └─ PostMessage(WM_CONNECTION_CLOSED) // 切换到 UI 线程处理
-
 WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
-  └─ 加锁 → 从 map 删除 → 解锁 → UpdateDeviceStatus("Not connected", Connect)
+  └─ 加锁 → 身份匹配才从 map 删除 → 解锁
+     → MarkDeviceClosed → UpdateDeviceStatus("Not connected", Connect)
 ```
+
+### 连接归属与 sink 生命周期
+
+手机能不能出声，全看**谁把 `AudioPlaybackConnection` 对象持有住**：
+
+- `StartAsync()` 才是"把 PC 配置成一个可被连接的 A2DP sink"的那一步，而这份配置**属于对象**。打开链路的那个对象一旦被释放，链路跟着断。
+- `OpenAsync()` 只是**请求**建立连接。返回 `Success` 只代表请求被受理，不代表有声音——真正的权威是连接自身的 `State()`，只有 `Opened` 才意味着音频在流。
+- 正因为"对象即资源"，同一个设备同时只能被一个连接跟踪，清理时**绝不能关掉不属于自己的那条连接**。
+
+下面每条规则背后都有对应的踩坑，破坏任意一条都会得到同一个症状：手机和 PC 两边都显示已连接，但音箱一点声音都没有。
+
+| 规则 | 为什么 |
+|------|--------|
+| map 表项用 `insert_or_assign` **替换**，绝不用 `emplace` | `emplace` 在已有表项时会静默保留旧对象，于是新连接在协程结束时被析构，而 UI 仍然声称设备已连接 |
+| 清理时只在**身份匹配**当前 map 表项时才关闭 | 旧的一次失败/重复请求绝不能把后来那条正常工作的连接关掉 |
+| 断开后启动 **1.5 秒重连冷却**（`g_lastCloseTime`） | Windows 需要一点时间释放 sink 端点；在端点还没释放完时重连，会得到一条"看着已连接、其实完全静音"的链路 |
+| 行内状态只有 `State() == Opened` 才显示 `Connected`，否则显示 `Connected, no audio` | "已连上"和"音频在流"是两个不同状态，只有后者才有声音 |
+| `WM_CONNECTION_CLOSED` / `WM_CONNECTION_OPENED` 都携带连接身份 | `StateChanged` 在蓝牙线程触发；过期的消息绝不能碰到更新的连接 |
 
 ### 设备弹窗（自绘）
 
@@ -110,7 +136,7 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 布局 | 头部（标题 + "N 台已连接" 副标题 + 刷新按钮）→ 3px 刷新动效线 → 可滚动的设备列表。动效线的边框在空闲时依然可见，因此显示/隐藏它不会引起列表跳动。 |
 | 刷新动效 | 3px `Border` 内嵌一个不确定进度的 `ProgressBar`。仅在刷新进行中显示；同一时间刷新按钮被禁用，副标题切换为"正在检测连接状态"。 |
 | 刷新按钮 | 重新执行 `RefreshDeviceList()`，重新查询 `System.Devices.Aep.IsConnected`。 |
-| 设备行 | 设备名、状态文本和一个操作按钮 —— *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）。已连接的设备排在最前。 |
+| 设备行 | 设备名、状态文本和一个操作按钮 —— *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）。已连接的设备排在最前。状态区分 *已连接*（音频正在通过本程序的连接流动）与 *已连接，无音频*（设备已连上但没有音频在流）；按钮只对**本程序自己管理的连接**提供 *断开* —— 只是链路连上（手机与系统相连、但没有本程序的连接对象）的设备提供 *连接*，否则用户看着"已连接"却没有任何办法把声音弄出来。 |
 | 原地更新 | `UpdateDeviceStatus` 直接修改既有行的状态文本、按钮文字、按钮颜色与目标操作；只有在刷新时才重建整个列表。按钮点击处理器捕获 `shared_ptr<DeviceRowState>`，因此可以重新指定某一行的操作（连接 → 断开）而无需重建。 |
 | 定位 | 通过 `Shell_NotifyIconGetRect` 锚定在托盘图标上方并右对齐，再钳制到最近显示器的工作区内。高度由固定的头部/行高指标（`FlyoutHeightForRows`）算出，而不是靠 `Measure` —— 岛的 XAML 树布局由岛自己负责 —— 并在每次刷新后重设，且保持底边不动。 |
 | 关闭方式 | 轻量关闭：焦点离开时（`WM_ACTIVATE`/`WA_INACTIVE`）自动隐藏。`g_flyoutHiddenTick` 记录关闭时刻，使"刚刚关闭它的那一次点击"不会立刻重新打开（300ms 保护）。 |
@@ -133,6 +159,7 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | `g_reconnect` | `bool` | 下次启动时自动重连 |
 | `g_shuttingDown` | `bool` | 退出时阻止协程访问已释放资源 |
 | `g_lastDevices` | `vector<wstring>` | 用于自动重连的设备 ID 列表 |
+| `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | 每台设备最近一次关闭的时刻 —— 驱动重连冷却 |
 
 ### 自定义窗口消息
 
@@ -140,13 +167,14 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 |------|------|
 | `WM_NOTIFYICON` (`WM_APP+1`) | 托盘图标点击、右键菜单 |
 | `WM_CONNECTDEVICE` (`WM_APP+2`) | 启动时自动重连触发器 |
-| `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged → UI 线程切换（线程安全） |
+| `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged(Closed) → UI 线程切换（线程安全） |
 | `WM_RUNONUITHREAD` (`WM_APP+4`) | 携带 `RunOnUiThread` 投递的可调用对象，由 WndProc 在 UI 线程上执行 |
+| `WM_CONNECTION_OPENED` (`WM_APP+5`) | StateChanged(Opened) → UI 线程切换；这一刻音频才真正开始流 |
 
 ### 线程安全（关键约束）
 
 1. **所有 XAML 对象访问必须在 UI 线程。** XAML Islands 对象有线程亲和性，且不具备 agile 特性。本程序运行在 STA 上，协程恢复点因此落回 UI 线程；此外每个改 XAML 的辅助函数都会再校验一次 `g_uiThreadId`，一旦发现不在 UI 线程就通过 `RunOnUiThread` 把自己重新投递回去。（这一点成立的前提是 `init_apartment` 收到了 `apartment_type::single_threaded` —— 它的默认值是 MTA，那样每一次 `co_await` 恢复都会落到线程池线程上，所有 XAML 更新都会以 `RPC_E_WRONG_THREAD` 失败。）
-2. **所有对 `g_audioPlaybackConnections` 的修改由 `g_connectionsMutex` 保护。** 无锁读写 = 数据竞争。
+2. **所有对 `g_audioPlaybackConnections` 的修改由 `g_connectionsMutex` 保护。** 无锁读写 = 数据竞争。`g_lastCloseTime` 由同一把锁保护,且 `IsCurrentConnection()` 内部会自行加锁 —— 绝不能在已持锁时调用它。
 3. **`StateChanged` 回调在蓝牙/音频后台线程触发。** 绝对不能直接操作 XAML 或 map，只能通过 PostMessage 将工作转到 UI 线程。
 4. **`ConnectDevice` 是 `fire_and_forget` 协程。** 协程恢复点在 UI 线程（STA），为了一致性仍然持锁。
 5. **所有协程入口检查 `g_shuttingDown`** — 防止退出时的 use-after-free。

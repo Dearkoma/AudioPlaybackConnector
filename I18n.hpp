@@ -33,6 +33,7 @@ void BuildChineseMap()
 	hashToStrMap.emplace(H(L"The operation was denied by the system"), L"操作被系统拒绝");
 	hashToStrMap.emplace(H(L"Unknown error"), L"未知错误");
 	hashToStrMap.emplace(H(L"Connected"), L"已连接");
+	hashToStrMap.emplace(H(L"Connected, no audio"), L"已连接，无音频");
 	hashToStrMap.emplace(H(L"All Devices Disconnected"), L"所有设备已断开");
 	hashToStrMap.emplace(H(L"All Bluetooth audio connections have been closed.\n\nYou can now reconnect your devices."), L"所有蓝牙音频连接已关闭。\n\n现在可以重新连接设备。");
 

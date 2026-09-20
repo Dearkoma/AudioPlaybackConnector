@@ -9,12 +9,12 @@
 #include <functional>
 #include <utility>
 
-// Posted with WM_CONNECTION_CLOSED: the device id of the connection that
-// closed, plus the AudioPlaybackConnection instance that actually closed.
-// WM_CONNECTION_CLOSED compares this against the current map entry so a stale
-// message from a previous connection to the same device can never remove a
-// newer, still-open connection.
-struct ConnectionClosedInfo
+// Posted with WM_CONNECTION_CLOSED / WM_CONNECTION_OPENED: the device id of the
+// connection the state change belongs to, plus the AudioPlaybackConnection
+// instance that reported it. Both handlers compare this against the current map
+// entry, so a stale message from a previous connection to the same device can
+// never touch a newer, still-open one.
+struct ConnectionEventInfo
 {
 	std::wstring deviceId;
 	winrt::Windows::Media::Audio::AudioPlaybackConnection connection;
@@ -122,6 +122,51 @@ void RunOnUiThread(Fn&& fn)
 		LOG_LAST_ERROR();
 		delete task;
 	}
+}
+
+// ── Connection ownership ─────────────────────────────────────────────
+// One device can only be tracked by a single AudioPlaybackConnection at a time,
+// and the tracked object is what owns the A2DP sink configuration. Everything
+// below exists so that (a) the object that actually opened the link is the one
+// kept in the map, and (b) cleanup only ever touches a connection the caller
+// really owns. Getting either wrong is what produces the "the phone is
+// connected but nothing comes out of the speakers" failure mode.
+
+// How long to wait after closing a connection before the same device may be
+// connected again. Windows needs a moment to release the old sink endpoint;
+// reconnecting into an endpoint that is still being torn down yields a link
+// that looks connected but stays silent.
+constexpr auto kReconnectCooldown = std::chrono::milliseconds(1500);
+
+// True when the map entry for this device is the very connection object passed
+// in. Must not be called with g_connectionsMutex held.
+bool IsCurrentConnection(std::wstring const& deviceId, AudioPlaybackConnection const& connection)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	auto it = g_audioPlaybackConnections.find(deviceId);
+	return it != g_audioPlaybackConnections.end() && it->second.second == connection;
+}
+
+// Remembers the moment a connection was closed so the next connect for the same
+// device can wait out kReconnectCooldown.
+void MarkDeviceClosed(std::wstring const& deviceId)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	g_lastCloseTime.insert_or_assign(deviceId, Clock::now());
+}
+
+// Waits out whatever is left of kReconnectCooldown for this device, if any.
+// Non-zero means the caller should wait that long before connecting again.
+std::chrono::milliseconds ReconnectCooldownRemaining(std::wstring const& deviceId)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	auto last = g_lastCloseTime.find(deviceId);
+	if (last == g_lastCloseTime.end()) return std::chrono::milliseconds::zero();
+
+	const auto elapsed = Clock::now() - last->second;
+	if (elapsed >= kReconnectCooldown) return std::chrono::milliseconds::zero();
+
+	return std::chrono::duration_cast<std::chrono::milliseconds>(kReconnectCooldown - elapsed);
 }
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -370,7 +415,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// StateChanged callback runs on an audio/Bluetooth background thread.
 		// It posts this message so all XAML UI updates and map mutations happen
 		// on the main UI thread, avoiding cross-thread races.
-		std::unique_ptr<ConnectionClosedInfo> info(reinterpret_cast<ConnectionClosedInfo*>(wParam));
+		std::unique_ptr<ConnectionEventInfo> info(reinterpret_cast<ConnectionEventInfo*>(wParam));
 		std::wstring closedDeviceId;
 		{
 			std::lock_guard<std::mutex> lock(g_connectionsMutex);
@@ -386,11 +431,43 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 		}
 
-		// Update the flyout outside the lock: calling into XAML while holding
-		// g_connectionsMutex risks a deadlock if a layout pass re-enters.
 		if (!closedDeviceId.empty())
 		{
+			// Start the reconnect cooldown from the moment the link went away:
+			// reconnecting into an endpoint that is still being released is how
+			// a phone ends up "connected" with no audio.
+			MarkDeviceClosed(closedDeviceId);
+
+			// Update the flyout outside the lock: calling into XAML while
+			// holding g_connectionsMutex risks a deadlock if a layout pass
+			// re-enters.
 			UpdateDeviceStatus(closedDeviceId, _(L"Not connected"), DeviceAction::Connect);
+		}
+		break;
+	}
+	case WM_CONNECTION_OPENED:
+	{
+		// StateChanged(Opened): the sink is really up and the phone's audio is
+		// now routed here. Until this arrives, a successful OpenAsync only means
+		// the request was accepted — the phone can be connected at the
+		// Bluetooth level with nothing actually streaming.
+		std::unique_ptr<ConnectionEventInfo> info(reinterpret_cast<ConnectionEventInfo*>(wParam));
+		std::wstring openedDeviceId;
+		std::wstring openedDeviceName;
+		{
+			std::lock_guard<std::mutex> lock(g_connectionsMutex);
+			auto it = g_audioPlaybackConnections.find(info->deviceId);
+			if (it != g_audioPlaybackConnections.end() && it->second.second == info->connection)
+			{
+				openedDeviceName = it->second.first.Name().c_str();
+				openedDeviceId = info->deviceId;
+			}
+		}
+
+		if (!openedDeviceId.empty())
+		{
+			LogEvent(L"Audio flowing: %s", openedDeviceName.c_str());
+			UpdateDeviceStatus(openedDeviceId, _(L"Connected"), DeviceAction::Disconnect);
 		}
 		break;
 	}
@@ -743,7 +820,12 @@ bool IsDeviceConnected(DeviceInformation const& device)
 	return false;
 }
 
-void AppendDeviceRow(DeviceInformation const& device, bool connected)
+// `connected` is "the device is linked" (which the system may report even when
+// this app never managed to open the audio stream); `streaming` is "audio is
+// actually flowing through this app's connection"; `managed` is "this app holds
+// the connection object". They differ often enough that the row has to show all
+// three, otherwise a silent link looks healthy.
+void AppendDeviceRow(DeviceInformation const& device, bool connected, bool streaming, bool managed)
 {
 	auto const& palette = CurrentFlyoutPalette();
 
@@ -758,8 +840,8 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected)
 	statusText.FontSize(12);
 	statusText.Margin(Thickness{ 0, 3, 0, 0 });
 	statusText.TextTrimming(TextTrimming::CharacterEllipsis);
-	statusText.Foreground(StatusBrush(connected ? DeviceAction::Disconnect : DeviceAction::Connect));
-	statusText.Text(connected ? _(L"Connected") : _(L"Not connected"));
+	statusText.Foreground(StatusBrush(!connected ? DeviceAction::Connect : (streaming ? DeviceAction::Disconnect : DeviceAction::Retry)));
+	statusText.Text(!connected ? _(L"Not connected") : (streaming ? _(L"Connected") : _(L"Connected, no audio")));
 
 	auto textPanel = StackPanel();
 	textPanel.VerticalAlignment(VerticalAlignment::Center);
@@ -769,9 +851,15 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected)
 	// The click handler captures only this shared state, so updating a row's
 	// action later (connect → disconnect, or an error → retry) does not require
 	// rebuilding the row.
+	//
+	// Only a connection this app manages can be closed by this app, so that is
+	// the only case offering Disconnect. A device that is merely linked (the
+	// phone is paired and connected, but no app has opened the audio stream)
+	// offers Connect instead — otherwise the user is stuck looking at
+	// "connected" with no way to actually get sound.
 	auto state = std::make_shared<DeviceRowState>();
 	state->deviceId = std::wstring(device.Id());
-	state->action = connected ? DeviceAction::Disconnect : DeviceAction::Connect;
+	state->action = (connected && managed) ? DeviceAction::Disconnect : DeviceAction::Connect;
 
 	auto actionButton = Button();
 	actionButton.FontSize(12);
@@ -830,13 +918,28 @@ void RebuildDeviceRows(std::vector<DeviceInformation> devices)
 		return;
 	}
 
-	std::vector<std::wstring> managed;
+	// Device id → is the audio stream actually open? An entry exists as soon as
+	// this app tracks the device, and the mapped value is the connection's own
+	// state — the only thing that tells "connected" apart from "connected, but
+	// no audio is flowing".
+	std::unordered_map<std::wstring, bool> managed;
 	{
 		std::lock_guard<std::mutex> lock(g_connectionsMutex);
 		managed.reserve(g_audioPlaybackConnections.size());
 		for (auto const& entry : g_audioPlaybackConnections)
 		{
-			managed.push_back(entry.first);
+			// State() can throw once the object has been closed underneath us;
+			// that only means "not streaming".
+			bool opened = false;
+			try
+			{
+				opened = entry.second.second.State() == AudioPlaybackConnectionState::Opened;
+			}
+			catch (winrt::hresult_error const&)
+			{
+				LOG_CAUGHT_EXCEPTION();
+			}
+			managed.emplace(entry.first, opened);
 		}
 	}
 
@@ -862,19 +965,37 @@ void RebuildDeviceRows(std::vector<DeviceInformation> devices)
 
 	// Connected devices first, so the ones in use are always at the top. The
 	// enumeration order is preserved within each group.
-	std::vector<std::pair<bool, DeviceInformation>> rows;
+	struct RowSeed
+	{
+		bool connected;
+		bool streaming;
+		bool managed;
+		DeviceInformation device;
+	};
+
+	std::vector<RowSeed> rows;
 	rows.reserve(devices.size());
 	for (auto const& device : devices)
 	{
 		const std::wstring deviceId(device.Id());
-		const bool managedDevice = std::find(managed.begin(), managed.end(), deviceId) != managed.end();
-		rows.emplace_back(managedDevice || IsDeviceConnected(device), device);
-	}
-	std::stable_sort(rows.begin(), rows.end(), [](auto const& a, auto const& b) { return a.first && !b.first; });
+		auto tracked = managed.find(deviceId);
+		const bool byApp = tracked != managed.end();
 
-	for (auto const& entry : rows)
+		// A device this app does not track is still "linked" when the system
+		// reports it as connected — that alone never produces sound, because
+		// no object of ours has configured the PC as a sink for it. The row
+		// says so and offers Connect instead of pretending it is fine.
+		rows.push_back(RowSeed{
+			byApp || IsDeviceConnected(device),
+			byApp && tracked->second,
+			byApp,
+			device });
+	}
+	std::stable_sort(rows.begin(), rows.end(), [](RowSeed const& a, RowSeed const& b) { return a.connected && !b.connected; });
+
+	for (auto const& row of rows)
 	{
-		AppendDeviceRow(entry.second, entry.first);
+		AppendDeviceRow(row.device, row.connected, row.streaming, row.managed);
 	}
 
 	UpdateFlyoutSubtitle();
@@ -1176,20 +1297,30 @@ void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status
 void DisconnectDevice(std::wstring const& deviceId)
 {
 	bool closed = false;
+	std::wstring closedName;
 	{
 		std::lock_guard<std::mutex> lock(g_connectionsMutex);
 		auto it = g_audioPlaybackConnections.find(deviceId);
 		if (it != g_audioPlaybackConnections.end())
 		{
+			closedName = it->second.first.Name().c_str();
 			it->second.second.Close();
 			g_audioPlaybackConnections.erase(it);
 			closed = true;
 			// StateChanged → WM_CONNECTION_CLOSED handles async endpoint
-			// cleanup on the UI thread.
+			// cleanup on the UI thread (and finds nothing, the entry is gone).
 		}
 	}
 
-	if (!closed)
+	// A manual disconnect arms the reconnect cooldown too: an immediate
+	// reconnect would land on an endpoint that has not been released yet.
+	MarkDeviceClosed(deviceId);
+
+	if (closed)
+	{
+		LogEvent(L"Disconnected by request: %s", closedName.c_str());
+	}
+	else
 	{
 		// The link was established outside this app (for example from Windows
 		// Settings), so it is not in our map. Create a throwaway connection
@@ -1323,35 +1454,92 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	if (g_shuttingDown) co_return;
 
-	LogEvent(L"Connecting: %s", device.Name().c_str());
+	// Kept in locals so they outlive every suspension point below.
+	const std::wstring deviceId(device.Id());
+	const std::wstring deviceName(device.Name());
+
+	LogEvent(L"Connecting: %s", deviceName.c_str());
 
 	// Disable the row's button while the request is in flight so a second
 	// click cannot start a competing connection to the same device.
-	UpdateDeviceStatus(device.Id(), _(L"Connecting"), DeviceAction::None);
+	UpdateDeviceStatus(deviceId, _(L"Connecting"), DeviceAction::None);
 
 	bool success = false;
+	bool opened = false;
+	bool replaced = false;
 	std::wstring errorMessage;
+	AudioPlaybackConnection connection{ nullptr };
 
 	try
 	{
-		auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
+		// Never reconnect into a sink endpoint Windows is still releasing: the
+		// reconnected phone would show up as connected while every sample is
+		// dropped. See kReconnectCooldown.
+		const auto cooldown = ReconnectCooldownRemaining(deviceId);
+		if (cooldown.count() > 0)
+		{
+			LogEvent(L"Waiting %lld ms before reconnecting: %s", static_cast<long long>(cooldown.count()), deviceName.c_str());
+			co_await winrt::resume_after(cooldown);
+			if (g_shuttingDown) co_return;
+		}
+
+		connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
 		if (connection)
 		{
 			{
 				std::lock_guard<std::mutex> lock(g_connectionsMutex);
-				g_audioPlaybackConnections.emplace(device.Id(), std::pair(device, connection));
+
+				// Replace, never emplace: the object in the map is the one that
+				// owns the sink configuration, so emplace() silently keeping an
+				// older object leaves the new connection to be destroyed at the
+				// end of this coroutine — the phone stays "connected" while no
+				// audio reaches the speakers.
+				auto existing = g_audioPlaybackConnections.find(deviceId);
+				if (existing != g_audioPlaybackConnections.end())
+				{
+					g_lastCloseTime.insert_or_assign(deviceId, Clock::now());
+					existing->second.second.Close();
+					g_audioPlaybackConnections.erase(existing);
+					replaced = true;
+				}
+
+				g_audioPlaybackConnections.insert_or_assign(deviceId, std::pair(device, connection));
 			}
 
-			connection.StateChanged([](const auto& sender, const auto&) {
-				if (sender.State() == AudioPlaybackConnectionState::Closed)
+			if (replaced)
+			{
+				// A tracked connection was closed just now, so this attempt is a
+				// reconnect as far as Windows is concerned: give the old sink
+				// endpoint the same moment to go away before claiming a new one.
+				LogEvent(L"Replacing the tracked connection for: %s", deviceName.c_str());
+				co_await winrt::resume_after(kReconnectCooldown);
+				if (g_shuttingDown) co_return;
+			}
+
+			connection.StateChanged([deviceId](const auto& sender, const auto&) {
+				// StateChanged fires on a background Bluetooth/audio thread.
+				// PostMessage marshals the work to the UI thread so we don't
+				// touch XAML objects or the global connection map from the wrong
+				// thread. The connection identity travels with the message so a
+				// stale one can never touch a newer connection.
+				//
+				// Nothing may escape a WinRT event handler: an unhandled
+				// exception here would take the whole process down.
+				try
 				{
-					// StateChanged fires on a background Bluetooth/audio thread.
-					// PostMessage marshals the work to the UI thread so we don't
-					// touch XAML objects (g_devicePicker) or the global connection
-					// map from the wrong thread. The connection identity is
-					// included so WM_CONNECTION_CLOSED can detect stale messages.
-					auto info = new ConnectionClosedInfo{ std::wstring(sender.DeviceId()), sender };
-					PostMessageW(g_hWnd, WM_CONNECTION_CLOSED, reinterpret_cast<WPARAM>(info), 0);
+					const auto state = sender.State();
+					auto info = new ConnectionEventInfo{ deviceId, sender };
+					if (!PostMessageW(g_hWnd,
+						state == AudioPlaybackConnectionState::Opened ? WM_CONNECTION_OPENED : WM_CONNECTION_CLOSED,
+						reinterpret_cast<WPARAM>(info), 0))
+					{
+						LOG_LAST_ERROR();
+						delete info;
+					}
+				}
+				catch (winrt::hresult_error const&)
+				{
+					LOG_CAUGHT_EXCEPTION();
 				}
 			});
 
@@ -1359,6 +1547,25 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			if (g_shuttingDown) co_return;
 			auto result = co_await connection.OpenAsync();
 			if (g_shuttingDown) co_return;
+
+			// The state after the request is what decides whether audio actually
+			// flows — OpenAsync returning Success only means the request was
+			// accepted. Both are logged so that "connected but silent" can be
+			// told apart from "could not connect" in a log sent in by a user.
+			auto state = AudioPlaybackConnectionState::Closed;
+			try
+			{
+				state = connection.State();
+			}
+			catch (winrt::hresult_error const&)
+			{
+				// A throwing State() must not be mistaken for a failed open:
+				// that path would close a connection that may well be working.
+				LOG_CAUGHT_EXCEPTION();
+			}
+			opened = state == AudioPlaybackConnectionState::Opened;
+			LogEvent(L"Open result: %s  status=%d  state=%d",
+				deviceName.c_str(), static_cast<int>(result.Status()), static_cast<int>(state));
 
 			switch (result.Status())
 			{
@@ -1414,25 +1621,47 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 
 	if (success)
 	{
-		UpdateDeviceStatus(device.Id(), _(L"Connected"), DeviceAction::Disconnect);
-		LogEvent(L"Connected: %s", device.Name().c_str());
+		// "The request was accepted" and "audio is flowing" are different
+		// states, and only the second one is worth telling the user about.
+		// StateChanged(Opened) flips the row to Connected if the sink comes up
+		// after this point.
+		UpdateDeviceStatus(deviceId, opened ? _(L"Connected") : _(L"Connected, no audio"), DeviceAction::Disconnect);
+		LogEvent(L"Connected: %s  (audio %s)", deviceName.c_str(), opened ? L"flowing" : L"not flowing yet");
 	}
 	else
 	{
+		// Close only a connection this coroutine owns. The map may hold a
+		// different object — a second attempt, or a link the phone established
+		// on its own — and closing that would drop a working connection.
+		if (connection)
 		{
-			std::lock_guard<std::mutex> lock(g_connectionsMutex);
-			auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
-			if (it != g_audioPlaybackConnections.end())
+			const bool owned = IsCurrentConnection(deviceId, connection);
+			if (owned)
 			{
 				// Close the connection; the StateChanged → WM_CONNECTION_CLOSED
 				// path handles the async endpoint cleanup and UI update on the
-				// correct thread — no Sleep() needed here.
-				it->second.second.Close();
-				g_audioPlaybackConnections.erase(it);
+				// correct thread — no Sleep() needed here. The entry is erased
+				// first so that message finds nothing instead of a half-closed
+				// connection.
+				std::lock_guard<std::mutex> lock(g_connectionsMutex);
+				auto it = g_audioPlaybackConnections.find(deviceId);
+				if (it != g_audioPlaybackConnections.end() && it->second.second == connection)
+				{
+					it->second.second.Close();
+					g_audioPlaybackConnections.erase(it);
+				}
 			}
+			else
+			{
+				LogEvent(L"Not closing the tracked connection for: %s", deviceName.c_str());
+				connection.Close(); // the throwaway object created above
+			}
+
+			if (owned) MarkDeviceClosed(deviceId);
 		}
-		LogEvent(L"Connect failed: %s  (%s)", device.Name().c_str(), errorMessage.c_str());
-		UpdateDeviceStatus(device.Id(), winrt::hstring(errorMessage.c_str()), DeviceAction::Retry);
+
+		LogEvent(L"Connect failed: %s  (%s)", deviceName.c_str(), errorMessage.c_str());
+		UpdateDeviceStatus(deviceId, winrt::hstring(errorMessage.c_str()), DeviceAction::Retry);
 	}
 }
 
@@ -1513,6 +1742,7 @@ void DisconnectAllDevices()
 	// Rows are updated after the lock is released — see WM_CONNECTION_CLOSED.
 	for (auto const& id : closedIds)
 	{
+		MarkDeviceClosed(id);
 		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}
 
@@ -1564,6 +1794,7 @@ winrt::fire_and_forget RestoreAudioService()
 
 	for (auto const& id : deviceIds)
 	{
+		MarkDeviceClosed(id);
 		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}
 

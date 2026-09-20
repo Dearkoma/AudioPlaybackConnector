@@ -14,11 +14,13 @@ using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Controls;
 using namespace winrt::Windows::UI::Xaml::Hosting;
 namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
 
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_CONNECTION_CLOSED = WM_APP + 3; // StateChanged → UI thread marshal
 constexpr UINT WM_RUNONUITHREAD = WM_APP + 4;     // marshals a callable onto the UI thread
+constexpr UINT WM_CONNECTION_OPENED = WM_APP + 5; // StateChanged(Opened) → UI thread marshal
 
 // Action offered by a device row's button in the flyout. None disables the
 // button (a connect is already in flight for that device).
@@ -87,7 +89,12 @@ WindowsXamlManager g_xamlManager{ nullptr };
 DWORD g_uiThreadId = 0;
 
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
-std::mutex g_connectionsMutex; // Protects g_audioPlaybackConnections
+std::mutex g_connectionsMutex; // Protects g_audioPlaybackConnections and g_lastCloseTime
+
+// When each device was last closed. Windows needs a moment to release a
+// just-closed A2DP sink endpoint, and reconnecting into a half-torn-down one is
+// what makes the phone connect while no audio comes out of the speakers.
+std::unordered_map<std::wstring, Clock::time_point> g_lastCloseTime;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
 NOTIFYICONDATAW g_nid = {
