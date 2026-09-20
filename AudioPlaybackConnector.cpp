@@ -269,33 +269,14 @@ HMENU BuildPopupMenu();
 void HandleMenuCommand(int cmd);
 
 // ── "Connected but silent" recovery ──────────────────────────────────
-// Watches the default output endpoint for a moment and reports whether any
-// audio showed up. Resolves true as soon as a sample is seen, and also when the
-// endpoint cannot be measured at all (see GetDefaultRenderPeak), so that an
-// unreadable endpoint never triggers a reconnect.
-winrt::IAsyncOperation<bool> WaitForAudioOnOutputEndpoint()
-{
-	const auto deadline = Clock::now() + kSilenceProbeWindow;
-
-	while (Clock::now() < deadline)
-	{
-		if (g_shuttingDown) co_return true;
-
-		const float peak = GetDefaultRenderPeak();
-		if (peak < 0.0f) co_return true; // unmeasurable: assume healthy
-		if (peak > kAudioPeakThreshold) co_return true;
-
-		co_await winrt::resume_after(kSilenceProbeInterval);
-	}
-
-	co_return false;
-}
-
-// Called after a connect succeeded. When Windows reports the link as open but
-// nothing is playing on the output, that is the known intermittent A2DP sink
-// failure that only a disconnect/reconnect clears — so do exactly that, up to
-// kMaxAutoReconnects times, and give up quietly afterwards (the row then offers
-// a manual "Reconnect" button).
+// Called after a connect succeeded. Windows can report the link as open while
+// not one audio byte ever reaches the output: the phone believes it is
+// streaming (and mutes its own speaker), the PC stays silent, and
+// AudioPlaybackConnection cannot tell that state from a healthy one because its
+// State() is already Opened. It is intermittent, it affects every A2DP sink
+// implementation on Windows, and the only known remedy is to tear the
+// connection down and renegotiate it — so measure the output, and do exactly
+// that, up to kMaxAutoReconnects times per user-initiated connect.
 winrt::fire_and_forget VerifyAudioAfterConnect(DeviceInformation device, int attempt)
 {
 	if (g_shuttingDown) co_return;
@@ -323,10 +304,28 @@ winrt::fire_and_forget VerifyAudioAfterConnect(DeviceInformation device, int att
 
 	// An open that never reached Opened is the same symptom seen from the other
 	// side: there is nothing to measure, so go straight to the reconnect.
+	//
+	// A phone needs a moment to start pushing samples after the link comes up,
+	// so watch for a window rather than sampling once. A reading that fails
+	// outright counts as healthy (see GetDefaultRenderPeak): an unmeasurable
+	// endpoint must never be the reason a connection gets torn down.
 	bool audio = false;
 	if (opened)
 	{
-		audio = co_await WaitForAudioOnOutputEndpoint();
+		const auto deadline = Clock::now() + kSilenceProbeWindow;
+		while (Clock::now() < deadline)
+		{
+			if (g_shuttingDown) co_return;
+
+			const float peak = GetDefaultRenderPeak();
+			if (peak < 0.0f || peak > kAudioPeakThreshold)
+			{
+				audio = true;
+				break;
+			}
+
+			co_await winrt::resume_after(kSilenceProbeInterval);
+		}
 	}
 	if (g_shuttingDown) co_return;
 
