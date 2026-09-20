@@ -368,6 +368,86 @@ void DestroyIsland()
 	g_xamlCanvas = nullptr;
 }
 
+// Refreshes the connection state of every device in the picker. Called right
+// after the picker is shown: the picker object is recreated on each open, so
+// any display status set during a previous session is lost — without this an
+// already-connected device would look disconnected and offer no way to
+// disconnect it.
+//
+// Pass 1 is synchronous and instant: whatever this process is managing is
+// marked immediately. Pass 2 is authoritative: it asks the system which A2DP
+// devices are actually connected, covering links established outside this app
+// (e.g. from Windows Settings).
+winrt::fire_and_forget RefreshDeviceConnectionStates(DevicePicker picker)
+{
+	if (!picker) co_return;
+
+	// Collect under the lock, but never call into XAML while holding it.
+	std::vector<DeviceInformation> managedDevices;
+	try
+	{
+		std::lock_guard<std::mutex> lock(g_connectionsMutex);
+		managedDevices.reserve(g_audioPlaybackConnections.size());
+		for (auto const& entry : g_audioPlaybackConnections)
+		{
+			managedDevices.push_back(entry.second.first);
+		}
+	}
+	catch (...)
+	{
+		LOG_CAUGHT_EXCEPTION();
+	}
+
+	for (auto const& device : managedDevices)
+	{
+		SafeSetDisplayStatus(picker, device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+	}
+
+	try
+	{
+		std::vector<winrt::hstring> requestedProperties{ L"System.Devices.Aep.IsConnected" };
+		auto devices = co_await DeviceInformation::FindAllAsync(
+			AudioPlaybackConnection::GetDeviceSelector(),
+			winrt::single_threaded_vector(std::move(requestedProperties)));
+
+		if (g_shuttingDown) co_return;
+
+		for (auto const& device : devices)
+		{
+			bool isConnected = false;
+			if (auto properties = device.Properties(); properties.HasKey(L"System.Devices.Aep.IsConnected"))
+			{
+				isConnected = winrt::unbox_value_or<bool>(properties.Lookup(L"System.Devices.Aep.IsConnected"), false);
+			}
+
+			bool managed = false;
+			{
+				std::lock_guard<std::mutex> lock(g_connectionsMutex);
+				managed = g_audioPlaybackConnections.find(std::wstring(device.Id())) != g_audioPlaybackConnections.end();
+			}
+
+			if (isConnected || managed)
+			{
+				SafeSetDisplayStatus(picker, device, _(L"Connected"), DevicePickerDisplayStatusOptions::ShowDisconnectButton);
+			}
+			else
+			{
+				// Not connected: clear any stale status left on the list entry.
+				SafeSetDisplayStatus(picker, device, {}, DevicePickerDisplayStatusOptions::None);
+			}
+		}
+	}
+	catch (winrt::hresult_error const&)
+	{
+		// Enumeration can fail (no radio, session issues). Pass 1 is already on
+		// screen, so the picker stays usable — just log and move on.
+		LOG_CAUGHT_EXCEPTION();
+	}
+	catch (...)
+	{
+	}
+}
+
 void ShowDevicePicker(Rect rect)
 {
 	// The picker needs the host window visible/foreground; size it full screen
@@ -400,6 +480,7 @@ void ShowDevicePicker(Rect rect)
 		});
 		g_devicePicker.DisconnectButtonClicked([](const auto& sender, const auto& args) {
 			auto device = args.Device();
+			bool closed = false;
 			{
 				std::lock_guard<std::mutex> lock(g_connectionsMutex);
 				auto it = g_audioPlaybackConnections.find(std::wstring(device.Id()));
@@ -407,15 +488,41 @@ void ShowDevicePicker(Rect rect)
 				{
 					it->second.second.Close();
 					g_audioPlaybackConnections.erase(it);
+					closed = true;
 					// StateChanged → WM_CONNECTION_CLOSED handles async
 					// endpoint cleanup on the UI thread.
 				}
 			}
+
+			if (!closed)
+			{
+				// The link was established outside this app (for example from
+				// Windows Settings), so it is not in our map. Create a
+				// throwaway connection object for the device and close it so
+				// the disconnect button still does something.
+				try
+				{
+					if (auto connection = AudioPlaybackConnection::TryCreateFromId(device.Id()))
+					{
+						connection.Close();
+						LogEvent(L"Disconnect (external link): %s", device.Name().c_str());
+					}
+				}
+				catch (winrt::hresult_error const&)
+				{
+					LOG_CAUGHT_EXCEPTION();
+				}
+			}
+
 			SafeSetDisplayStatus(sender, device, {}, DevicePickerDisplayStatusOptions::None);
 		});
 
 		using namespace winrt::Windows::UI::Popups;
 		g_devicePicker.Show(rect, Placement::Above);
+
+		// Detect the connection state of every device in the list, so an
+		// already-connected device is shown as connected (left-click refresh).
+		RefreshDeviceConnectionStates(g_devicePicker);
 	}
 	catch (winrt::hresult_error const&)
 	{
