@@ -17,7 +17,7 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 - **Language:** C++20 (latest standard), C++/WinRT 2.0, WIL
 - **UI:** Win32 window + XAML Islands (`DesktopWindowXamlSource`)
 - **Device list:** self-drawn flyout with a live refresh indicator and a refresh button — the system `DevicePicker` can host neither
-- **Silent-link detection:** a connection Windows reports as open but that carries no audio (an intermittent A2DP sink failure seen in every Windows implementation) is detected by metering the output endpoint and reported honestly, with a one-click *Reconnect* to run the documented workaround by hand
+- **Honest link status, and no guesswork:** a row says *Connected* only when the sink reports itself open, and *Connected, no audio* otherwise — but nothing ever tears a link down on a guess. The intermittent "Windows says connected, no audio arrives" failure (seen in every Windows A2DP sink implementation) is left to the one documented remedy, offered as a one-click *Reconnect*, plus a read-only endpoint diagnostic in the tray menu
 - **Threading:** Single-threaded apartment — `winrt::init_apartment(winrt::apartment_type::single_threaded)`. XAML islands require an STA, and note that `init_apartment` **defaults to MTA**: in an MTA a coroutine resumes on a thread pool thread after every `co_await`, so any XAML call from there fails with `RPC_E_WRONG_THREAD`, and the island never initialises at all.
 - **Toolset:** Visual Studio 2022, v143 platform toolset
 - **OS Target:** Windows 10 2004+ (10.0.19041.0)
@@ -56,8 +56,7 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 wWinMain()
   ├─ winrt::init_apartment()          // STA
   ├─ CreateWindowExW (1×1 layered)    // tray-only window, alpha 0
-  ├─ LoadSettings()                   // restore g_reconnect, g_fixSilentConnection,
-  │                                   // g_lastDevices
+  ├─ LoadSettings()                   // restore g_reconnect, g_lastDevices
   ├─ SetupSvgIcon()                   // Direct2D → HICON light/dark
   ├─ UpdateNotifyIcon()               // Shell_NotifyIcon
   ├─ PostMessage(WM_CONNECTDEVICE)    // auto-reconnect on start
@@ -81,8 +80,7 @@ RefreshDeviceList() [fire_and_forget]
      SetFlyoutRefreshing(false)
 
 Row button click → ConnectDevice() / DisconnectDevice() / ReconnectDeviceNow()
-ConnectDevice(DeviceInformation, autoReconnectAttempt, allowAutoReconnect)
-                                       [fire_and_forget]
+ConnectDevice(DeviceInformation)      [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // row updated in place, button disabled
   ├─ Wait out the reconnect cooldown  // see "Connection Ownership" below
   ├─ AudioPlaybackConnection::TryCreateFromId()
@@ -92,23 +90,19 @@ ConnectDevice(DeviceInformation, autoReconnectAttempt, allowAutoReconnect)
   ├─ connection.OpenAsync()           // suspend & wait — requests the link
   └─ On success: State()==Opened → "Connected", otherwise "Connected, no audio"
                  (StateChanged(Opened) upgrades the row if the sink comes up later)
-                 → VerifyAudioAfterConnect()  // only while *Reconnect when silent* is on
+                 Nothing else: this path makes no Core Audio calls at all, so a
+                 silent link can never be caused by the app watching it — see
+                 "The Silent-Link Failure" below
      On failure: close ONLY a connection this coroutine owns, then
                  UpdateDeviceStatus(error, Retry)
 
-VerifyAudioAfterConnect(device, attempt, allowAutoReconnect) [fire_and_forget]
-  ├─ Wait for the link to actually reach Opened (up to 4 s) — deliberately NOT a
-  │    State() snapshot: OpenAsync returning Success still reports Closed, and
-  │    Opened arrives through StateChanged about a second later
-  ├─ Then sample the default render endpoint every 250 ms for 3 s
-  ├─ Audio seen on the endpoint (or an endpoint that cannot be read) → log
-  │    "Audio confirmed" and stop
-  └─ No audio → log the measurement plus a full endpoint inventory, and the row
-       stops claiming audio is flowing: "Connected, no audio"
-       Only when *Reconnect when silent* is ON and the connect was not itself a
-       manual reconnect: DisconnectDevice() → 1.5 s cooldown →
-       ConnectDevice(..., false). One attempt, and the follow-up connect never
-       re-arms this
+ReconnectDeviceNow(deviceId)          // the *Reconnect* button, and nothing else
+  ├─ DisconnectDevice()               // also arms the cooldown
+  └─ ConnectDevice(deviceId)          // one click, one reconnect — never chains
+
+Tray menu → IDM_LOG_AUDIO_INVENTORY → LogAudioInventory()   // read-only, on demand
+  └─ Logs every active render endpoint with its level, plus the default
+     endpoint's friendly name, volume and mute state. Disconnects nothing.
 
 StateChanged (OPENED)                 // fires on Bluetooth/audio thread
   └─ PostMessage(WM_CONNECTION_OPENED) // marshals to UI thread
@@ -147,7 +141,7 @@ shows connected on both sides, and nothing comes out of the speakers.
 | A row reads `Connected` only when `State() == Opened`; otherwise `Connected, no audio` | "Linked" and "streaming" are different states, and only the second one produces sound |
 | `WM_CONNECTION_CLOSED` / `WM_CONNECTION_OPENED` carry the connection identity | `StateChanged` fires on a Bluetooth thread; a stale message must never touch a newer connection |
 
-### "Connected but silent": the issue that is *not* ours
+### The silent-link failure: diagnosed, never auto-repaired
 
 A second failure mode looks identical to the user and cannot be fixed by the
 ownership rules above, because there is nothing wrong on this side:
@@ -159,26 +153,32 @@ ownership rules above, because there is nothing wrong on this side:
   (Microsoft's own Bluetooth Audio Receiver included), and the only known
   remedy is to tear the connection down and renegotiate it.
 
-`AudioPlaybackConnection` cannot see this state — it already says `Opened` — so
-the app measures the **default render endpoint's peak level** instead
-(`IAudioMeterInformation`, via Core Audio).
+`AudioPlaybackConnection` cannot see this state — it already says `Opened` — and
+**the app does not try to detect it in order to act on it.** An earlier version
+did: it metered the default render endpoint (`IAudioMeterInformation`, via Core
+Audio) and disconnected any link that stayed silent for 2.5 s, running the
+documented workaround automatically. That was wrong twice over:
 
-**That measurement is a report, not a trigger.** An earlier version disconnected
-the device whenever the output stayed silent for 2.5 s, running the documented
-workaround automatically. It was wrong twice over: a silent output cannot be
-told apart from a phone that has not started playing yet (or is between two
-tracks), so it tore down healthy connections — and because tearing the link down
-makes the phone pause, the next reading was silent too. It proved itself right
-by breaking something that worked. Measuring is what can be automated; deciding
-to reconnect is the user's, which is what the *Reconnect* button is for.
+- A silent output cannot be told apart from a phone that has not started playing
+  yet (or is between two tracks), so it tore down healthy connections.
+- Tearing a link down makes the phone pause, so the next reading was silent too:
+  it proved itself right by breaking something that worked.
+
+The automatic repair was therefore removed, and the setting that gated it was
+deleted rather than defaulted to `false` — a key that is still read would keep
+the old behaviour alive on any machine whose config file was written by the
+version that defaulted it **on**. What remains:
 
 | Piece | Behaviour |
 |-------|-----------|
-| `GetDefaultRenderPeak()` | Peak sample value on the default render endpoint, or **negative** when it cannot be read at all. An unmeasurable endpoint is treated as healthy, never as silence — otherwise every connection would look broken on a machine whose audio stack the app cannot query. |
-| `VerifyAudioAfterConnect()` | Only runs while *Reconnect when silent* is on. Waits for `Opened` (up to 4 s, re-reading the state — never a snapshot), then samples the endpoint every 250 ms for 3 s. On silence it logs the measurement and moves the row to *Connected, no audio*, then disconnects and reopens once — a single attempt per user-initiated connect, and the follow-up connect never re-arms it. |
-| `LogAudioInventory()` | Diagnostics only, written after a silent observation: every active render endpoint with its level, plus the default one's friendly name, volume and mute state. A log sent in then says whether the audio went to another device, whether the default endpoint is muted or at zero, or that nothing entered the audio stack at all. |
-| `ReconnectDeviceNow()` | The manual workaround in one click (disconnect + connect), which is what the *Reconnect* button calls. It never chains into the automatic reconnect — one click, one reconnect. |
-| *Reconnect when silent* (tray menu) | Switches the whole thing on (`fixSilentConnection` in the JSON config). **Off by default**, and off means the connect path makes no Core Audio calls at all — which is exactly why it is off: a silent link and a broken link stop being indistinguishable from this code, and "is this build the one that goes quiet?" becomes a question a test can answer. |
+| The connect path | Makes **no Core Audio calls at all**, so a silent link can never be caused by the app watching it. That is what makes "is this build the one that goes quiet?" a question a test can answer. |
+| `ReconnectDeviceNow()` | The manual workaround in one click (disconnect + connect), i.e. what the *Reconnect* button calls. One click, one reconnect — it never chains. |
+| `LogAudioInventory()` | Read-only, and only on request (tray menu: *Log Audio Endpoint Inventory*). Logs every active render endpoint with its level, plus the default endpoint's friendly name, volume and mute state, so a report can be attributed to the audio going elsewhere, to a muted default endpoint, or to nothing entering the audio stack at all. |
+| Row status | *Connected* vs *Connected, no audio* still distinguishes "linked" from "streaming", but nothing acts on it. |
+
+The lesson this cost two releases: **measuring and acting are different
+decisions.** Measuring is cheap and safe. Acting on a signal that cannot tell
+"broken" apart from "not playing yet" is neither.
 
 ### Device Flyout
 
@@ -219,7 +219,6 @@ flyout replaces it so the whole surface is under the app's control.
 | `g_flyoutRefreshing` | `bool` | A refresh is in flight — drives the indicator and disables the refresh button |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | Visibility, plus the tick guard that stops the closing click from reopening the flyout |
 | `g_reconnect` | `bool` | Reconnect on next launch |
-| `g_fixSilentConnection` | `bool` | Off by default. Gates the whole "measure the output endpoint" step: with it on, a silent output is logged (plus an endpoint inventory) and the link is disconnected/reopened once per user-initiated connect (tray menu: *Reconnect when silent*) |
 | `g_shuttingDown` | `bool` | Prevent coroutines from touching freed resources on exit |
 | `g_lastDevices` | `vector<wstring>` | Device IDs for auto-reconnect |
 | `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | When each device was last closed — drives the reconnect cooldown |
@@ -257,5 +256,5 @@ flyout replaces it so the whole surface is under the app's control.
 | View Logs | Opens `AudioPlaybackConnector.log` in the default handler |
 | Disconnect All | Closes all connections, updates UI immediately |
 | Restart Bluetooth Audio | Close all → wait 1s → stagger-reconnect each device |
-| Reconnect when silent | Checkbox for `g_fixSilentConnection` — lets the app disconnect/reopen a link whose output endpoint measures no audio. Off by default |
+| Log Audio Endpoint Inventory | Read-only diagnostic: writes every render endpoint and its level, plus the default endpoint's name/volume/mute state, to the log. Changes nothing |
 | Exit | Flyout with "Reconnect on next start" checkbox |

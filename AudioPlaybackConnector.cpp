@@ -95,7 +95,7 @@ enum : UINT
 	IDM_VIEW_LOGS,
 	IDM_DISCONNECT_ALL,
 	IDM_RESTART_AUDIO,
-	IDM_FIX_SILENT,
+	IDM_LOG_AUDIO_INVENTORY,
 	IDM_EXIT,
 };
 
@@ -139,33 +139,29 @@ void RunOnUiThread(Fn&& fn)
 // that looks connected but stays silent.
 constexpr auto kReconnectCooldown = std::chrono::milliseconds(1500);
 
-// ── "Connected but silent" observation ───────────────────────────────
+// ── "Connected but silent" is diagnosed, never acted on ──────────────
 // A second, unrelated failure mode looks identical to the user: Windows
 // accepts the connection and reports State() == Opened, the phone believes it
 // is streaming to the PC, both ends stay silent, and not one audio byte ever
 // reaches the speakers. It is intermittent and it affects every A2DP sink
 // implementation on Windows (including Microsoft's own Bluetooth Audio
 // Receiver). Because AudioPlaybackConnection already reports Opened, the
-// connection API cannot tell that state apart from a healthy one — reading the
-// output endpoint's signal level is the only way to see it.
+// connection API cannot tell that state apart from a healthy one.
 //
-// How long to wait for the link to reach Opened at all. OpenAsync returning
-// Success only means the request was accepted: measured on a working machine,
-// State() still reads Closed at that instant, and Opened arrives through
-// StateChanged about half a second to a second later. Judging it any earlier
-// is judging the wrong thing.
-constexpr auto kOpenObserveWindow = std::chrono::milliseconds(4000);
-// How long to watch the default output endpoint for audio once the link is up.
-constexpr auto kAudioObserveWindow = std::chrono::milliseconds(3000);
-constexpr auto kObserveInterval = std::chrono::milliseconds(250);
-// Digital silence is exactly 0.0; anything above this is real audio.
-constexpr float kAudioPeakThreshold = 0.0001f;
-// Automatic reconnects per user-initiated connect, and only while "Reconnect
-// when silent" is switched on. One is enough: the documented manual workaround
-// is a single reconnect, and since silence cannot be told apart from a phone
-// that has not started playing yet, a second attempt would only tear down more
-// links that were never broken.
-constexpr int kMaxAutoReconnects = 1;
+// The app therefore never tries to detect it in order to act on it. An earlier
+// version watched the output endpoint's level and disconnected anything that
+// stayed silent, on the theory that the documented remedy is a reconnect. That
+// was wrong twice over: silence cannot be told apart from a phone that has not
+// started playing yet (or is between two tracks), so it tore down healthy
+// links; and tearing a link down makes the phone pause, so the next reading was
+// silent too — it proved itself right by breaking something that worked.
+//
+// What remains is read-only and on demand: "Log Audio Endpoint Inventory"
+// writes every render endpoint's level plus the default one's name, volume and
+// mute state to the log. Those lines are what tell "the audio went to another
+// device", "the default endpoint is muted" and "nothing entered the audio stack
+// at all" apart. Reconnecting is still the remedy — as a button the user
+// presses, not as a watchdog.
 
 // True when the map entry for this device is the very connection object passed
 // in. Must not be called with g_connectionsMutex held.
@@ -198,62 +194,13 @@ std::chrono::milliseconds ReconnectCooldownRemaining(std::wstring const& deviceI
 	return std::chrono::duration_cast<std::chrono::milliseconds>(kReconnectCooldown - elapsed);
 }
 
-// Peak sample value currently playing on the default render endpoint (0.0 =
-// silence, 1.0 = full scale), or a negative number when it cannot be measured
-// at all. The two are deliberately different: "could not read the endpoint"
-// must not be mistaken for "the endpoint is silent", or every connection would
-// look broken on a machine whose audio stack the app cannot query.
-//
-// COM is already initialised for this thread: the app runs in a single-threaded
-// apartment (see wWinMain) and every coroutine continuation resumes on that
-// same thread, so no CoInitializeEx call is needed here.
-float GetDefaultRenderPeak()
-{
-	try
-	{
-		winrt::com_ptr<IMMDeviceEnumerator> enumerator;
-		if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-			__uuidof(IMMDeviceEnumerator), enumerator.put_void())))
-		{
-			return -1.0f;
-		}
-
-		winrt::com_ptr<IMMDevice> endpoint;
-		if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, endpoint.put())))
-		{
-			return -1.0f;
-		}
-
-		winrt::com_ptr<IAudioMeterInformation> meter;
-		if (FAILED(endpoint->Activate(__uuidof(IAudioMeterInformation), CLSCTX_ALL, nullptr, meter.put_void())))
-		{
-			return -1.0f;
-		}
-
-		float peak = 0.0f;
-		if (FAILED(meter->GetPeakValue(&peak)))
-		{
-			return -1.0f;
-		}
-
-		return peak;
-	}
-	catch (...)
-	{
-		// Not worth failing over, but worth one line in the log: the caller
-		// treats "unmeasurable" as "healthy" so it never reconnects on a guess,
-		// and this makes that decision visible when a log is sent in.
-		LogEvent(L"Could not read the default output endpoint level");
-		return -1.0f;
-	}
-}
-
 // ── Audio endpoint inventory (diagnostics only) ──────────────────────
-// Called only when the observation below found no audio on the output, and it
-// only ever writes to the log. Between them these lines say which of the three
+// Runs only when the user asks for it from the tray menu, and it only ever
+// writes to the log. Between them these lines say which of the three
 // possibilities it is — the audio went to another device, the default endpoint
 // is muted or at zero volume, or nothing entered the audio stack at all —
-// instead of leaving it to yet another guess.
+// instead of leaving it to yet another guess. Nothing here disconnects, mutes
+// or reconfigures anything.
 //
 // PKEY_Device_FriendlyName is spelled out here rather than pulled in from
 // functiondiscoverykeys_devpkey.h, which would drag in its own linkage rules
@@ -368,8 +315,8 @@ void LogAudioInventory()
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK FlyoutWndProc(HWND, UINT, WPARAM, LPARAM);
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, bool allowAutoReconnect = true);
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int autoReconnectAttempt = 0, bool allowAutoReconnect = true);
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId);
+winrt::fire_and_forget ConnectDevice(DeviceInformation device);
 void SetupSvgIcon();
 void UpdateNotifyIcon();
 void DisconnectAllDevices();
@@ -389,125 +336,6 @@ void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status
 bool IsSystemLightTheme();
 HMENU BuildPopupMenu();
 void HandleMenuCommand(int cmd);
-
-// ── "Connected but silent" observation ───────────────────────────────
-// Called after a connect succeeded and reports what it finds. Reporting is all
-// it does unless "Reconnect when silent" is switched on.
-//
-// An earlier version always acted on a silent output and disconnected the
-// device, on the theory that the documented remedy for the "connected but no
-// audio" failure is a reconnect. That was wrong twice over: a silent output
-// cannot be told apart from a phone that simply has not started playing yet (or
-// is between two tracks), so it tore down healthy links; and because tearing
-// the link down makes the phone pause, the next reading was silent too — it
-// proved itself right by breaking something that worked. Reconnecting is still
-// the remedy, but it is the user's decision: that is what the Reconnect button
-// is for, and it is why the automatic version is off by default and limited to
-// a single attempt when it is switched on.
-winrt::fire_and_forget VerifyAudioAfterConnect(DeviceInformation device, int attempt, bool allowAutoReconnect)
-{
-	if (g_shuttingDown) co_return;
-
-	// Kept in locals so they outlive the suspension points below.
-	const std::wstring deviceId(device.Id());
-	const std::wstring deviceName(device.Name().c_str());
-
-	const auto started = Clock::now();
-	bool opened = false;
-	bool audio = false;
-	bool unreadable = false;
-	auto audioWindow = Clock::now() + kAudioObserveWindow;
-
-	while (true)
-	{
-		if (g_shuttingDown) co_return;
-
-		// Wait for the link itself first. Opened arrives asynchronously, after
-		// OpenAsync has already returned (see kOpenObserveWindow), so a State()
-		// snapshot taken at that moment must never be used as a verdict — it is
-		// Closed on a healthy connection.
-		if (!opened)
-		{
-			bool live = false;
-			try
-			{
-				std::lock_guard<std::mutex> lock(g_connectionsMutex);
-				auto it = g_audioPlaybackConnections.find(deviceId);
-				live = it != g_audioPlaybackConnections.end() &&
-					it->second.second.State() == AudioPlaybackConnectionState::Opened;
-			}
-			catch (winrt::hresult_error const&)
-			{
-				LOG_CAUGHT_EXCEPTION();
-			}
-
-			if (live)
-			{
-				opened = true;
-				audioWindow = Clock::now() + kAudioObserveWindow;
-			}
-		}
-
-		// A reading that fails outright counts as healthy (see
-		// GetDefaultRenderPeak): an endpoint this process cannot measure must
-		// never be reported as silent, or every connection on a machine whose
-		// audio stack cannot be queried would look broken.
-		const float peak = GetDefaultRenderPeak();
-		if (peak < 0.0f)
-		{
-			unreadable = true;
-			break;
-		}
-		if (peak > kAudioPeakThreshold)
-		{
-			audio = true;
-			break;
-		}
-
-		if (opened && Clock::now() >= audioWindow) break;
-		if (!opened && Clock::now() >= started + kOpenObserveWindow) break;
-
-		co_await winrt::resume_after(kObserveInterval);
-	}
-	if (g_shuttingDown) co_return;
-
-	if (audio || unreadable)
-	{
-		LogEvent(L"Audio confirmed on the output endpoint: %s%s", deviceName.c_str(),
-			unreadable ? L"  (level not readable, assumed healthy)" : L"");
-		co_return;
-	}
-
-	LogEvent(L"No audio on the output endpoint after connecting: %s  (link opened=%d)",
-		deviceName.c_str(), opened ? 1 : 0);
-	LogAudioInventory();
-
-	// Leave the link alone: the output endpoint is the wrong witness to tell
-	// "this connection is broken" apart from "the phone is not playing right
-	// now", and tearing down a good link is what makes the phone pause. So
-	// report the measurement by default, and act on it only when the user asked
-	// for the automatic reconnect — a single attempt, and the follow-up connect
-	// never re-arms it.
-	if (!g_fixSilentConnection || !allowAutoReconnect || attempt >= kMaxAutoReconnects)
-	{
-		// Stop claiming audio is flowing. The row re-reads State() whenever the
-		// flyout is rebuilt, so this clears itself, and the Reconnect button
-		// next to it is the manual way out.
-		UpdateDeviceStatus(deviceId, _(L"Connected, no audio"), DeviceAction::Disconnect);
-		co_return;
-	}
-
-	LogEvent(L"Reconnecting: %s  (automatic reconnect %d/%d)",
-		deviceName.c_str(), attempt + 1, kMaxAutoReconnects);
-
-	// DisconnectDevice closes the connection, forgets it and arms the reconnect
-	// cooldown; ConnectDevice then waits that cooldown out before opening again.
-	DisconnectDevice(deviceId);
-	co_await winrt::resume_after(kReconnectCooldown);
-	if (g_shuttingDown) co_return;
-
-	ConnectDevice(device, attempt + 1, false);
-}
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	_In_opt_ HINSTANCE hPrevInstance,
@@ -1697,9 +1525,7 @@ void ReconnectDeviceNow(std::wstring const& deviceId)
 {
 	LogEvent(L"Reconnect by request: %s", deviceId.c_str());
 	DisconnectDevice(deviceId);
-	// One click, one reconnect: a manual reconnect must never chain into the
-	// automatic one, or the user asks for a single reconnect and gets three.
-	ConnectDevice(deviceId, false);
+	ConnectDevice(deviceId);
 }
 
 void ShowExitConfirmation()
@@ -1752,8 +1578,7 @@ HMENU BuildPopupMenu()
 	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(menu, MF_STRING, IDM_DISCONNECT_ALL, _(L"Disconnect All"));
 	AppendMenuW(menu, MF_STRING, IDM_RESTART_AUDIO, _(L"Restart Bluetooth Audio"));
-	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-	AppendMenuW(menu, MF_STRING | (g_fixSilentConnection ? MF_CHECKED : 0), IDM_FIX_SILENT, _(L"Reconnect when silent"));
+	AppendMenuW(menu, MF_STRING, IDM_LOG_AUDIO_INVENTORY, _(L"Log Audio Endpoint Inventory"));
 	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(menu, MF_STRING, IDM_EXIT, _(L"Exit"));
 
@@ -1789,10 +1614,13 @@ void HandleMenuCommand(int cmd)
 	case IDM_RESTART_AUDIO:
 		RestoreAudioService();
 		break;
-	case IDM_FIX_SILENT:
-		g_fixSilentConnection = !g_fixSilentConnection;
-		SaveSettings();
-		LogEvent(L"Reconnect when silent: %s", g_fixSilentConnection ? L"on" : L"off");
+	case IDM_LOG_AUDIO_INVENTORY:
+		// Read-only, and only on request: writes the active render endpoints
+		// and their levels to the log, so a "connected but silent" report can
+		// be attributed to the audio going elsewhere, to a muted default
+		// endpoint, or to nothing entering the audio stack at all. It
+		// disconnects nothing and changes no state.
+		LogAudioInventory();
 		break;
 	case IDM_EXIT:
 		ShowExitConfirmation();
@@ -1817,7 +1645,7 @@ void RebuildUi()
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(DeviceInformation device, int autoReconnectAttempt, bool allowAutoReconnect)
+winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	if (g_shuttingDown) co_return;
 
@@ -1825,9 +1653,6 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int autoReconnect
 	const std::wstring deviceId(device.Id());
 	const std::wstring deviceName(device.Name());
 
-	// One line per connect, so a log sent in by a user shows exactly how many
-	// times the link was (re)opened. The automatic reconnect logs its own line
-	// before it tears the old link down.
 	LogEvent(L"Connecting: %s", deviceName.c_str());
 
 	// Disable the row's button while the request is in flight so a second
@@ -1998,18 +1823,13 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int autoReconnect
 		UpdateDeviceStatus(deviceId, opened ? _(L"Connected") : _(L"Connected, no audio"), DeviceAction::Disconnect);
 		LogEvent(L"Connected: %s  (audio %s)", deviceName.c_str(), opened ? L"flowing" : L"not flowing yet");
 
-		// Success here only means Windows accepted the request. Whether audio
-		// actually reaches the output endpoint can only be measured, and this
-		// whole measurement is switched off by default: with it off, the audio
-		// path of this build makes no Core Audio calls at all and behaves
-		// exactly like the release before it, which is what makes "does the
-		// silence come from here?" a question a test can answer. Switching
-		// "Reconnect when silent" on observes, logs what it finds, and
-		// reconnects once if the user wants that.
-		if (g_fixSilentConnection)
-		{
-			VerifyAudioAfterConnect(device, autoReconnectAttempt, allowAutoReconnect);
-		}
+		// Nothing else happens here on purpose. Windows can report a link as
+		// open that never carries a single audio byte, and this connect path
+		// must stay identical to the releases from before any such behaviour
+		// existed — including making no Core Audio calls at all — so that "does
+		// the silence come from this build?" remains a question a test can
+		// answer. Diagnosis is on demand (tray menu: "Log Audio Endpoint
+		// Inventory"); repairing a silent link is the Reconnect button.
 	}
 	else
 	{
@@ -2048,7 +1868,7 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device, int autoReconnect
 	}
 }
 
-winrt::fire_and_forget ConnectDevice(std::wstring deviceId, bool allowAutoReconnect)
+winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 {
 	if (g_shuttingDown) co_return;
 
@@ -2056,7 +1876,7 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId, bool allowAutoReconn
 	const winrt::hstring id(deviceId.c_str());
 	auto device = co_await DeviceInformation::CreateFromIdAsync(id);
 	if (g_shuttingDown) co_return;
-	ConnectDevice(device, 0, allowAutoReconnect);
+	ConnectDevice(device);
 }
 
 void SetupSvgIcon()

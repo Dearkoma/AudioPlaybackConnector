@@ -28,6 +28,7 @@ void BuildChineseMap()
 	hashToStrMap.emplace(H(L"Disconnect All"), L"断开全部");
 	hashToStrMap.emplace(H(L"Restart Bluetooth Audio"), L"重启蓝牙音频");
 	hashToStrMap.emplace(H(L"View Logs"), L"查看日志");
+	hashToStrMap.emplace(H(L"Log Audio Endpoint Inventory"), L"记录音频端点诊断");
 	hashToStrMap.emplace(H(L"Connecting"), L"正在连接");
 	hashToStrMap.emplace(H(L"The request timed out"), L"请求超时");
 	hashToStrMap.emplace(H(L"The operation was denied by the system"), L"操作被系统拒绝");
@@ -47,7 +48,6 @@ void BuildChineseMap()
 	hashToStrMap.emplace(H(L"Disconnect"), L"断开");
 	hashToStrMap.emplace(H(L"Retry"), L"重试");
 	hashToStrMap.emplace(H(L"Reconnect"), L"重连");
-	hashToStrMap.emplace(H(L"Reconnect when silent"), L"连接后无音频时自动重连");
 	hashToStrMap.emplace(H(L"Refresh"), L"刷新");
 	hashToStrMap.emplace(H(L"This will disconnect and reconnect the audio connections managed by AudioPlaybackConnector.\n\n"
 	                      L"No system services are touched — only this app's own connections are affected.\n"

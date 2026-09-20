@@ -17,7 +17,7 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 - **语言：** C++20 (latest standard)，C++/WinRT 2.0，WIL
 - **UI：** Win32 窗口 + XAML Islands (`DesktopWindowXamlSource`)
 - **设备列表：** 自绘弹窗，带刷新动效线条与刷新按钮 —— 系统 `DevicePicker` 无法承载这两者
-- **静音链路识别：** Windows 报告链路正常、却一个音频字节都没送过来的情形（Windows 各实现上都存在的间歇性 A2DP sink 故障），通过测量输出端点电平识别并如实显示；弹窗里提供一键**「重连」**，把文档里那套解法交给用户手动执行
+- **如实显示连接状态，绝不凭猜测动手：** 只有 sink 报告自己已打开时该行才显示 *已连接*，否则显示 *已连接，无音频*；但程序**不会**依据任何测量结果去拆链路。间歇性的"Windows 说已连接、音频却一个字节都不来"（Windows 各 A2DP sink 实现上都存在）只交给文档里那唯一的解法 —— 弹窗里的一键**「重连」**，外加右键菜单里一项只读的端点诊断
 - **线程模型：** 单线程套间 —— `winrt::init_apartment(winrt::apartment_type::single_threaded)`。XAML Islands 必须运行在 STA 上；注意 `init_apartment` **默认是 MTA**：在 MTA 下协程每次 `co_await` 之后都会在线程池线程上恢复，于是任何 XAML 调用都会以 `RPC_E_WRONG_THREAD` 失败，而且岛根本无法完成初始化。
 - **工具集：** Visual Studio 2022，v143 平台工具集
 - **系统要求：** Windows 10 2004+ (10.0.19041.0)
@@ -56,8 +56,7 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 wWinMain()
   ├─ winrt::init_apartment()          // STA 单线程套间
   ├─ CreateWindowExW (1×1 layered)    // 仅托盘的窗口，alpha = 0
-  ├─ LoadSettings()                   // 恢复 g_reconnect、g_fixSilentConnection、
-  │                                   // g_lastDevices
+  ├─ LoadSettings()                   // 恢复 g_reconnect、g_lastDevices
   ├─ SetupSvgIcon()                   // Direct2D → HICON 图标（亮/暗色）
   ├─ UpdateNotifyIcon()               // Shell_NotifyIcon
   ├─ PostMessage(WM_CONNECTDEVICE)    // 启动时自动重连
@@ -81,8 +80,7 @@ RefreshDeviceList() [fire_and_forget]
      SetFlyoutRefreshing(false)
 
 行内按钮点击 → ConnectDevice() / DisconnectDevice() / ReconnectDeviceNow()
-ConnectDevice(DeviceInformation, autoReconnectAttempt, allowAutoReconnect)
-                                       [fire_and_forget]
+ConnectDevice(DeviceInformation)      [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // 原地更新该行，按钮禁用
   ├─ 先等够重连冷却               // 见下文"连接归属与 sink 生命周期"
   ├─ AudioPlaybackConnection::TryCreateFromId()
@@ -92,19 +90,17 @@ ConnectDevice(DeviceInformation, autoReconnectAttempt, allowAutoReconnect)
   ├─ connection.OpenAsync()           // 挂起等待 —— 请求建立链路
   └─ 成功：State()==Opened → "Connected"，否则 "Connected, no audio"
            （之后若 sink 起来，StateChanged(Opened) 会把该行升级为已连接）
-           → VerifyAudioAfterConnect()  // 仅在"连接后无音频时自动重连"勾选时
+           此外**什么都不做**：这条路径里一次 Core Audio 调用都没有，所以静音链路
+           绝不可能由"程序去测量它"引起 —— 见下文"静音链路故障"
      失败：只关闭本次协程自己拥有的连接，再 UpdateDeviceStatus(错误信息, Retry)
 
-VerifyAudioAfterConnect(device, attempt, allowAutoReconnect) [fire_and_forget]
-  ├─ 先等链路真正到达 Opened（最多 4 秒）—— 刻意**不用** State() 快照判断：
-  │    OpenAsync 返回时 State() 仍是 Closed，Opened 要等 StateChanged 约一秒后才到
-  ├─ 然后每 250ms 采一次默认输出端点的电平，共观察 3 秒
-  ├─ 测到音频（或端点根本读不到）→ 记一行 "Audio confirmed" 后结束
-  └─ 测不到音频 → 记录测量结果 + 一份端点清单，并让该行不再假装有声音：
-       "已连接，无音频"
-       只有右键菜单「连接后无音频时自动重连」**已勾选**、且本次连接本身不是
-       手动「重连」时才动手：断开 → 等 1.5 秒冷却 → ConnectDevice(..., false)。
-       只尝试一次，且后续那次连接不会再次触发自动重连
+ReconnectDeviceNow(deviceId)          // 「重连」按钮调用的唯一东西
+  ├─ DisconnectDevice()               // 同时启动重连冷却
+  └─ ConnectDevice(deviceId)          // 点一次就是一次，绝不连锁
+
+托盘菜单 → IDM_LOG_AUDIO_INVENTORY → LogAudioInventory()   // 只读、按需触发
+  └─ 把所有活动渲染端点及其电平写进日志，外加默认端点的友好名、音量与静音状态。
+     不断开任何连接、不改变任何状态。
 
 StateChanged (OPENED 状态)            // 在蓝牙/音频线程触发
   └─ PostMessage(WM_CONNECTION_OPENED) // 切换到 UI 线程处理
@@ -136,7 +132,7 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 行内状态只有 `State() == Opened` 才显示 `Connected`，否则显示 `Connected, no audio` | "已连上"和"音频在流"是两个不同状态，只有后者才有声音 |
 | `WM_CONNECTION_CLOSED` / `WM_CONNECTION_OPENED` 都携带连接身份 | `StateChanged` 在蓝牙线程触发；过期的消息绝不能碰到更新的连接 |
 
-### "连上了却没声音"：这类问题**不在我们这边**
+### 静音链路故障：只诊断，绝不自动修复
 
 还有另一种故障，用户看到的症状完全一样，但上面那些归属规则救不了它，因为我们这边根本没错：
 
@@ -145,17 +141,21 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 - 音频一个字节都没到达输出端点 —— 两端都是静音。
 - 它是**间歇性**的，Windows 上所有 A2DP sink 实现都中招（微软自家的 Bluetooth Audio Receiver 也一样），而**唯一已知的解法就是把链路彻底断掉、重新协商一次**。
 
-`AudioPlaybackConnection` 看不到这个状态（它早就说 `Opened` 了），所以本程序改为**测量默认输出端点的峰值电平**（Core Audio 的 `IAudioMeterInformation`）。
+`AudioPlaybackConnection` 看不到这个状态（它早就说 `Opened` 了），而**本程序不会为了"动手"去检测它**。早期版本这么干过：它测量默认输出端点的峰值电平（Core Audio 的 `IAudioMeterInformation`），一旦发现 2.5 秒内始终静音就自动断开重连。这个设计错得很彻底：
 
-**这个测量是"报告"，不是"扳机"。** 早期版本一旦发现输出端点在 2.5 秒内始终静音，就自动断开重连，替用户执行文档里那套解法。这个设计错得很彻底：**静音的输出端点，和"手机还没开始放音（或正好在两首歌之间）"根本无法区分**，所以它会拆掉本来健康的连接；而拆掉链路又会让手机暂停播放，于是下一次照样测得静音 —— 它用"把好用的东西弄坏"来证明自己是对的。能自动化的是**测量**；要不要重连是用户的决定，这正是**「重连」**按钮存在的意义。
+- **静音的输出端点，和"手机还没开始放音（或正好在两首歌之间）"根本无法区分**，所以它会拆掉本来健康的连接；
+- 而拆掉链路又会让手机暂停播放，于是下一次照样测得静音 —— 它用"把好用的东西弄坏"来证明自己是对的。
+
+因此**整套自动修复被删除**；那个开关设置也**连带删掉**而不是改成默认 `false` —— 只要这个键还在被读取，任何一份由"默认开启"那版写下的配置文件都会让旧行为继续生效。现在剩下的东西：
 
 | 组成 | 行为 |
 |------|------|
-| `GetDefaultRenderPeak()` | 默认输出端点的峰值电平；**读不到时返回负数**。读不到一律按"正常"处理，绝不当作静音 —— 否则在本程序查询不了音频栈的机器上，每一条连接都会被误判成坏的。 |
-| `VerifyAudioAfterConnect()` | 仅在右键菜单「连接后无音频时自动重连」勾选时才会运行。先等链路到达 `Opened`（最多 4 秒，反复重读状态，**绝不用快照**），再每 250ms 采一次、观察 3 秒。测不到音频时记录测量结果、把该行改成 *已连接，无音频*，然后断开重开**一次** —— 每次用户主动连接只尝试一次，且后续那次连接不会再次触发。 |
-| `LogAudioInventory()` | 纯诊断，只在测得静音后写入：列出所有活动渲染端点及其电平，外加默认端点的友好名、音量与静音状态。这样收到日志就能一句话分清是"音频跑去了别的设备"、"默认端点被静音了"还是"音频压根没进音频栈"。 |
-| `ReconnectDeviceNow()` | 把手工解法做成一键（断开 + 连接），也就是「重连」按钮调用的东西。它**不会**再连锁触发自动重连 —— 点一次就是一次。 |
-| 右键菜单「连接后无音频时自动重连」 | 开关整套行为（JSON 配置里的 `fixSilentConnection`）。**默认关闭**，而"关闭"意味着连接路径里**一次 Core Audio 调用都没有** —— 这正是它默认关的原因：静音链路和故障链路不再被本程序的代码搅在一起，"是不是这个版本把声音弄没的"就变成一个测试能回答的问题。 |
+| 连接路径 | **一次 Core Audio 调用都没有**，所以静音链路绝不可能由"程序去测量它"引起。这正是"是不是这个版本把声音弄没的"能被一个测试回答的原因。 |
+| `ReconnectDeviceNow()` | 把手工解法做成一键（断开 + 连接），也就是「重连」按钮调用的东西。点一次就是一次，**不会**连锁。 |
+| `LogAudioInventory()` | 只读、且只在你点的时候跑（右键菜单「记录音频端点诊断」）。把所有活动渲染端点及其电平写进日志，外加默认端点的友好名、音量与静音状态 —— 这样收到日志就能一句话分清是"音频跑去了别的设备"、"默认端点被静音了"还是"音频压根没进音频栈"。 |
+| 行内状态 | *已连接* 与 *已连接，无音频* 依然区分"链路连上"和"音频在流"，但**没有任何代码据此动手**。 |
+
+这轮花了两个版本才换来的教训：**"测量"和"动手"是两个不同的决定。** 测量便宜且安全；而依据一个分不清"坏了"和"还没开始"的信号去动手，既不便宜也不安全。
 
 ### 设备弹窗（自绘）
 
@@ -193,7 +193,6 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | `g_flyoutRefreshing` | `bool` | 是否有刷新在进行 —— 驱动动效线并禁用刷新按钮 |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | 可见性，以及防止"关闭它的那次点击"重新打开的时钟保护 |
 | `g_reconnect` | `bool` | 下次启动时自动重连 |
-| `g_fixSilentConnection` | `bool` | 默认关闭。它管住整套"测量输出端点"的动作：勾选后，测不到音频会写日志（含端点清单），并把该链路断开重开一次（每次用户主动连接最多一次）。右键菜单中的"连接后无音频时自动重连" |
 | `g_shuttingDown` | `bool` | 退出时阻止协程访问已释放资源 |
 | `g_lastDevices` | `vector<wstring>` | 用于自动重连的设备 ID 列表 |
 | `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | 每台设备最近一次关闭的时刻 —— 驱动重连冷却 |
@@ -231,5 +230,5 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 查看日志 | 用默认程序打开 `AudioPlaybackConnector.log` |
 | 断开全部 | 关闭所有连接，立即更新 UI |
 | 重启蓝牙音频 | 全部关闭 → 等待 1 秒 → 逐个错开重连 |
-| 连接后无音频时自动重连 | `g_fixSilentConnection` 的勾选项 —— 打开"测量输出端点 + 测不到音频时断开重开一次"整套行为。**默认关闭**（关闭时连接路径里不含任何 Core Audio 调用） |
+| 记录音频端点诊断 | 只读诊断：把所有渲染端点及其电平、以及默认端点的名称/音量/静音状态写进日志。不改变任何状态 |
 | 退出 | 弹出确认窗口，可选"下次启动自动重连" |

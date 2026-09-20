@@ -6,10 +6,6 @@ constexpr auto BUFFER_SIZE = 4096;
 void DefaultSettings()
 {
 	g_reconnect = false;
-	// Off by default: acting on a silent output endpoint tears down healthy
-	// links, and with it off the connect path stays free of Core Audio calls
-	// (see AudioPlaybackConnector.h).
-	g_fixSilentConnection = false;
 	g_lastDevices.clear();
 	g_language.clear(); // auto-detect
 }
@@ -44,10 +40,6 @@ void LoadSettings()
 		if (reconnect && reconnect.ValueType() == JsonValueType::Boolean)
 			g_reconnect = reconnect.GetBoolean();
 
-		auto fixSilent = jsonObj.TryLookup(L"fixSilentConnection");
-		if (fixSilent && fixSilent.ValueType() == JsonValueType::Boolean)
-			g_fixSilentConnection = fixSilent.GetBoolean();
-
 		auto language = jsonObj.TryLookup(L"language");
 		if (language && language.ValueType() == JsonValueType::String)
 			g_language = std::wstring(language.GetString());
@@ -73,7 +65,13 @@ void SaveSettings()
 	{
 		JsonObject jsonObj;
 		jsonObj.Insert(L"reconnect", JsonValue::CreateBooleanValue(g_reconnect));
-		jsonObj.Insert(L"fixSilentConnection", JsonValue::CreateBooleanValue(g_fixSilentConnection));
+		// "fixSilentConnection" used to live here. It is gone on purpose rather
+		// than defaulted to false: the file is rewritten from scratch below, so
+		// simply not writing the key removes it from every existing config —
+		// and a key that is still read would have kept the old behaviour alive
+		// on any machine whose config was written by a version that defaulted
+		// it ON. A setting that survives a feature is how a "default off" ships
+		// enabled.
 		if (!g_language.empty())
 			jsonObj.Insert(L"language", JsonValue::CreateStringValue(g_language));
 
