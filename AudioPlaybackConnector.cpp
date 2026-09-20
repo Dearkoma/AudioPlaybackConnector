@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <utility>
 
 // Posted with WM_CONNECTION_CLOSED: the device id of the connection that
 // closed, plus the AudioPlaybackConnection instance that actually closed.
@@ -96,6 +98,32 @@ enum : UINT
 	IDM_EXIT,
 };
 
+// ── UI thread marshalling ────────────────────────────────────────────
+// XAML objects are not agile: they belong to the thread that created them, and
+// a call from any other thread fails with RPC_E_WRONG_THREAD. Coroutine
+// continuations are the danger here — in a multi-threaded apartment they resume
+// on whatever thread pool thread completed the async operation, so every XAML
+// update that follows a co_await has to be marshalled back through this helper.
+// The app runs single-threaded (see wWinMain), which already resumes coroutines
+// on the UI thread; this is the belt-and-braces path for anything that still
+// arrives from elsewhere.
+template <typename Fn>
+void RunOnUiThread(Fn&& fn)
+{
+	if (GetCurrentThreadId() == g_uiThreadId)
+	{
+		fn();
+		return;
+	}
+
+	auto task = new std::function<void()>(std::forward<Fn>(fn));
+	if (!PostMessageW(g_hWnd, WM_RUNONUITHREAD, 0, reinterpret_cast<LPARAM>(task)))
+	{
+		LOG_LAST_ERROR();
+		delete task;
+	}
+}
+
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK FlyoutWndProc(HWND, UINT, WPARAM, LPARAM);
 winrt::fire_and_forget ConnectDevice(std::wstring deviceId);
@@ -133,7 +161,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	wil::SetResultLoggingCallback(WriteWilDiagnosticsToFile);
 	LogEvent(L"Application started");
 
-	winrt::init_apartment();
+	// XAML islands require a single-threaded apartment. Note that
+	// winrt::init_apartment() defaults to apartment_type::multi_threaded: in an
+	// MTA the thread has no apartment context for continuations to be sent
+	// back to, so every coroutine after a co_await resumes on a thread pool
+	// thread and any XAML call from there fails with RPC_E_WRONG_THREAD. An MTA
+	// also stops the XAML framework from initialising the island at all.
+	winrt::init_apartment(winrt::apartment_type::single_threaded);
+	g_uiThreadId = GetCurrentThreadId();
 
 	bool supported = false;
 	try
@@ -220,6 +255,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		LogEvent(L"Application exiting");
 		DestroyFlyout();
 
+		// Tear the XAML framework down for this thread, after the island that
+		// lives on it is gone.
+		if (g_xamlManager)
+		{
+			try
+			{
+				g_xamlManager.Close();
+			}
+			catch (...)
+			{
+				// Shutting down anyway; never fail the exit path over this.
+			}
+			g_xamlManager = nullptr;
+		}
+
 		// Save settings while we still have the connection list intact
 		SaveSettings();
 
@@ -296,6 +346,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 		}
 		break;
+	case WM_RUNONUITHREAD:
+	{
+		// A callable posted by RunOnUiThread. This thread owns every XAML
+		// object, so it is the only one allowed to run it.
+		std::unique_ptr<std::function<void()>> task(reinterpret_cast<std::function<void()>*>(lParam));
+		if (task && *task)
+		{
+			(*task)();
+		}
+		break;
+	}
 	case WM_CONNECTDEVICE:
 		if (g_reconnect)
 		{
@@ -361,6 +422,16 @@ namespace
 	constexpr wchar_t kFlyoutClassName[] = L"AudioPlaybackConnectorFlyout";
 	constexpr float kFlyoutWidthDip = 340.0f;
 
+	// The flyout height is computed from its contents rather than measured: the
+	// island lays the XAML tree out itself, and interleaving the app's own
+	// Measure pass with that layout is fragile. Header, indicator and row
+	// heights are therefore fixed, which makes the sum exact.
+	constexpr int kFlyoutHeaderHeightDip = 60; // title + subtitle + refresh button
+	constexpr int kFlyoutIndicatorHeightDip = 3; // separator line / refresh indicator
+	constexpr int kFlyoutRowHeightDip = 56;      // one device row, divider included
+	constexpr int kFlyoutMaxListDip = 392;       // list is capped at this and scrolls beyond
+	constexpr int kFlyoutEmptyListDip = 46;      // "No devices found" line
+
 	// Colors are baked into the XAML instead of using ThemeResource: the island
 	// has no Application object, so theme resources do not reliably resolve.
 	// They follow the system app theme — the same registry value the tray icon
@@ -425,6 +496,68 @@ SolidColorBrush SolidBrush(std::wstring_view hex)
 	return brush;
 }
 
+// Sizes the island's own child window to the flyout's client area.
+//
+// This is not optional: the island starts out at 0x0 and the framework never
+// makes it follow the host window (verified on Windows 11 — resizing the host
+// leaves the island at 1x1), so without this call the flyout window opens and
+// stays completely unpainted, which looks exactly like "the tray click did
+// nothing". UI thread only.
+void ResizeFlyoutXamlHost()
+{
+	if (!g_hWndFlyout || !g_hWndFlyoutXaml) return;
+
+	RECT client{};
+	if (!GetClientRect(g_hWndFlyout, &client)) return;
+
+	const int width = client.right - client.left;
+	const int height = client.bottom - client.top;
+	if (width <= 0 || height <= 0) return;
+
+	SetWindowPos(g_hWndFlyoutXaml, nullptr, 0, 0, width, height,
+		SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+// Height the flyout needs for the given number of device rows, in pixels.
+int FlyoutHeightForRows(int rowCount, UINT dpi)
+{
+	int listDip = kFlyoutEmptyListDip;
+	if (rowCount > 0)
+	{
+		listDip = rowCount * kFlyoutRowHeightDip;
+		if (listDip > kFlyoutMaxListDip) listDip = kFlyoutMaxListDip;
+	}
+
+	int height = MulDiv(kFlyoutHeaderHeightDip + kFlyoutIndicatorHeightDip + listDip, dpi, USER_DEFAULT_SCREEN_DPI);
+	const int minHeight = MulDiv(96, dpi, USER_DEFAULT_SCREEN_DPI);
+	const int maxHeight = MulDiv(560, dpi, USER_DEFAULT_SCREEN_DPI);
+	if (height < minHeight) height = minHeight;
+	if (height > maxHeight) height = maxHeight;
+	return height;
+}
+
+// Keeps the window height in sync with the row count after a refresh. The
+// bottom edge stays put, so the flyout grows upwards from the tray icon
+// instead of sliding under the taskbar. UI thread only.
+void UpdateFlyoutHeight()
+{
+	if (!g_flyoutVisible || !g_hWndFlyout) return;
+
+	UINT dpi = GetDpiForWindow(g_hWndFlyout);
+	if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
+
+	RECT rect{};
+	if (!GetWindowRect(g_hWndFlyout, &rect)) return;
+
+	const int width = rect.right - rect.left;
+	const int target = FlyoutHeightForRows(static_cast<int>(g_deviceRows.size()), dpi);
+	if (target == rect.bottom - rect.top) return;
+
+	SetWindowPos(g_hWndFlyout, nullptr, rect.left, rect.bottom - target, width, target,
+		SWP_NOZORDER | SWP_NOACTIVATE);
+	ResizeFlyoutXamlHost();
+}
+
 // Layout: header (title + subtitle + refresh button) → refresh indicator →
 // scrolling device list. The indicator sits in a 3px border that stays visible
 // even when idle, so showing/hiding it never shifts the list.
@@ -434,9 +567,9 @@ std::wstring BuildFlyoutXaml(FlyoutPalette const& p)
   <Grid.RowDefinitions>
     <RowDefinition Height="Auto"/>
     <RowDefinition Height="Auto"/>
-    <RowDefinition Height="Auto"/>
+    <RowDefinition Height="*"/>
   </Grid.RowDefinitions>
-  <Grid Grid.Row="0" Padding="14,10,10,10">
+  <Grid Grid.Row="0" Height="60" Padding="14,10,10,10">
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="*"/>
       <ColumnDefinition Width="Auto"/>
@@ -481,6 +614,13 @@ std::wstring BuildFlyoutXaml(FlyoutPalette const& p)
 
 void ApplyFlyoutTexts()
 {
+	// XAML only — hop back to the UI thread if a coroutine called us.
+	if (GetCurrentThreadId() != g_uiThreadId)
+	{
+		RunOnUiThread([] { ApplyFlyoutTexts(); });
+		return;
+	}
+
 	if (!g_flyoutRoot) return;
 
 	try
@@ -498,6 +638,13 @@ void ApplyFlyoutTexts()
 
 void UpdateFlyoutSubtitle()
 {
+	// XAML only — hop back to the UI thread if a coroutine called us.
+	if (GetCurrentThreadId() != g_uiThreadId)
+	{
+		RunOnUiThread([] { UpdateFlyoutSubtitle(); });
+		return;
+	}
+
 	if (!g_flyoutRoot || !g_flyoutSubtitle) return;
 
 	try
@@ -529,6 +676,13 @@ void UpdateFlyoutSubtitle()
 
 void SetFlyoutRefreshing(bool refreshing)
 {
+	// XAML only — hop back to the UI thread if a coroutine called us.
+	if (GetCurrentThreadId() != g_uiThreadId)
+	{
+		RunOnUiThread([refreshing] { SetFlyoutRefreshing(refreshing); });
+		return;
+	}
+
 	g_flyoutRefreshing = refreshing;
 
 	if (g_flyoutRoot)
@@ -642,7 +796,7 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected)
 	});
 
 	auto row = Grid();
-	row.Padding(Thickness{ 14, 9, 14, 9 });
+	row.Padding(Thickness{ 14, 8, 14, 8 });
 
 	auto nameColumn = ColumnDefinition();
 	nameColumn.Width(GridLength{ 1.0, GridUnitType::Star });
@@ -657,6 +811,8 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected)
 	row.Children().Append(actionButton);
 
 	auto divider = Border();
+	// Fixed height so the window height (FlyoutHeightForRows) is exact.
+	divider.Height(kFlyoutRowHeightDip);
 	divider.BorderThickness(Thickness{ 0, 1, 0, 0 });
 	divider.BorderBrush(SolidBrush(palette.border));
 	divider.Child(row);
@@ -665,8 +821,15 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected)
 	g_deviceRows.push_back(DeviceRow{ state->deviceId, statusText, actionButton, state });
 }
 
-void RebuildDeviceRows(std::vector<DeviceInformation> const& devices)
+void RebuildDeviceRows(std::vector<DeviceInformation> devices)
 {
+	// XAML only — hop back to the UI thread if a coroutine called us.
+	if (GetCurrentThreadId() != g_uiThreadId)
+	{
+		RunOnUiThread([devices = std::move(devices)]() mutable { RebuildDeviceRows(std::move(devices)); });
+		return;
+	}
+
 	std::vector<std::wstring> managed;
 	{
 		std::lock_guard<std::mutex> lock(g_connectionsMutex);
@@ -686,11 +849,14 @@ void RebuildDeviceRows(std::vector<DeviceInformation> const& devices)
 	{
 		auto emptyText = TextBlock();
 		emptyText.FontSize(12);
-		emptyText.Margin(Thickness{ 14, 12, 14, 12 });
+		emptyText.Height(kFlyoutEmptyListDip);
+		emptyText.VerticalAlignment(VerticalAlignment::Center);
+		emptyText.Margin(Thickness{ 14, 0, 14, 0 });
 		emptyText.Foreground(SolidBrush(palette.textSecondary));
 		emptyText.Text(_(L"No devices found"));
 		g_flyoutDeviceList.Children().Append(emptyText);
 		UpdateFlyoutSubtitle();
+		UpdateFlyoutHeight();
 		return;
 	}
 
@@ -712,6 +878,7 @@ void RebuildDeviceRows(std::vector<DeviceInformation> const& devices)
 	}
 
 	UpdateFlyoutSubtitle();
+	UpdateFlyoutHeight();
 }
 
 void CreateFlyout()
@@ -740,9 +907,20 @@ void CreateFlyout()
 
 	try
 	{
+		// The XAML framework's core window has to exist for this thread before
+		// the first island is created on it.
+		if (!g_xamlManager)
+		{
+			g_xamlManager = WindowsXamlManager::InitializeForCurrentThread();
+		}
+
 		g_flyoutSource = DesktopWindowXamlSource();
 		g_flyoutSourceNative2 = g_flyoutSource.as<IDesktopWindowXamlSourceNative2>();
 		winrt::check_hresult(g_flyoutSourceNative2->AttachToWindow(g_hWndFlyout));
+
+		// The child window that actually paints the XAML. Kept so it can be
+		// resized with the flyout (see ResizeFlyoutXamlHost).
+		winrt::check_hresult(g_flyoutSourceNative2->get_WindowHandle(&g_hWndFlyoutXaml));
 
 		auto root = winrt::Windows::UI::Xaml::Markup::XamlReader::Load(BuildFlyoutXaml(CurrentFlyoutPalette())).as<Grid>();
 		g_flyoutRoot = root;
@@ -763,6 +941,10 @@ void CreateFlyout()
 		DestroyFlyout();
 		return;
 	}
+
+	// The island starts at 0x0 and never follows the host window by itself:
+	// without this the flyout would open and stay completely unpainted.
+	ResizeFlyoutXamlHost();
 
 	ApplyFlyoutTexts();
 	SetFlyoutRefreshing(false);
@@ -794,6 +976,7 @@ void DestroyFlyout()
 		g_flyoutSource = nullptr;
 	}
 	g_flyoutSourceNative2 = nullptr;
+	g_hWndFlyoutXaml = nullptr; // goes away with its host window below
 
 	if (g_hWndFlyout)
 	{
@@ -828,6 +1011,11 @@ LRESULT CALLBACK FlyoutWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 			HideDeviceFlyout();
 		}
 		break;
+	case WM_SIZE:
+		// The island never resizes itself with its host (see
+		// ResizeFlyoutXamlHost), so every size change has to be forwarded.
+		ResizeFlyoutXamlHost();
+		break;
 	case WM_CLOSE:
 		HideDeviceFlyout();
 		return 0;
@@ -847,19 +1035,15 @@ void ShowDeviceFlyout()
 		UINT dpi = GetDpiForWindow(g_hWndFlyout);
 		if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
 
-		// Measure with a fixed width constraint to get the natural content
-		// height. The width is fixed by the DIP constant, and the list is
-		// capped by the ScrollViewer's MaxHeight, so the result is stable.
-		g_flyoutRoot.Measure(Size{ kFlyoutWidthDip, 4000.0f });
-		auto desired = g_flyoutRoot.DesiredSize();
-
 		// windows.h defines min/max macros, so std::clamp/std::max would be
 		// mangled in this translation unit; clamp explicitly instead.
 		auto clampTo = [](int value, int low, int high) { return value < low ? low : (value > high ? high : value); };
 
 		const int width = MulDiv(static_cast<int>(kFlyoutWidthDip), dpi, USER_DEFAULT_SCREEN_DPI);
-		int height = static_cast<int>(std::lround(desired.Height * dpi / USER_DEFAULT_SCREEN_DPI));
-		height = clampTo(height, MulDiv(96, dpi, USER_DEFAULT_SCREEN_DPI), MulDiv(560, dpi, USER_DEFAULT_SCREEN_DPI));
+		// Height comes from the fixed header/row metrics rather than from a
+		// Measure pass: the island owns the layout of its tree, and interleaving
+		// our own measure with it is fragile.
+		const int height = FlyoutHeightForRows(static_cast<int>(g_deviceRows.size()), dpi);
 
 		// Anchor to the tray icon: above it and right-aligned, like a tray flyout.
 		RECT icon{};
@@ -887,6 +1071,8 @@ void ShowDeviceFlyout()
 		}
 
 		SetWindowPos(g_hWndFlyout, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
+		// Give the island the new client size, otherwise the window opens empty.
+		ResizeFlyoutXamlHost();
 		SetForegroundWindow(g_hWndFlyout);
 		g_flyoutVisible = true;
 
@@ -922,7 +1108,7 @@ winrt::fire_and_forget RefreshDeviceList()
 			list.push_back(device);
 		}
 
-		RebuildDeviceRows(list);
+		RebuildDeviceRows(std::move(list));
 	}
 	catch (winrt::hresult_error const&)
 	{
@@ -940,6 +1126,18 @@ winrt::fire_and_forget RefreshDeviceList()
 
 void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status, DeviceAction action)
 {
+	// XAML only — hop back to the UI thread if a coroutine called us.
+	if (GetCurrentThreadId() != g_uiThreadId)
+	{
+		std::wstring id(deviceId);
+		winrt::hstring text(status);
+		RunOnUiThread([id = std::move(id), text = std::move(text), action]
+		{
+			UpdateDeviceStatus(id, text, action);
+		});
+		return;
+	}
+
 	if (g_flyoutRoot)
 	{
 		try

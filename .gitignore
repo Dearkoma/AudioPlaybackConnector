@@ -341,3 +341,6 @@ healthchecksdb
 
 translate/generated
 error/
+
+# WorkBuddy project data (memory files, etc.) - never commit
+.workbuddy/

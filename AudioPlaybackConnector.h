@@ -18,6 +18,7 @@ namespace fs = std::filesystem;
 constexpr UINT WM_NOTIFYICON = WM_APP + 1;
 constexpr UINT WM_CONNECTDEVICE = WM_APP + 2;
 constexpr UINT WM_CONNECTION_CLOSED = WM_APP + 3; // StateChanged → UI thread marshal
+constexpr UINT WM_RUNONUITHREAD = WM_APP + 4;     // marshals a callable onto the UI thread
 
 // Action offered by a device row's button in the flyout. None disables the
 // button (a connect is already in flight for that device).
@@ -70,6 +71,20 @@ std::vector<DeviceRow> g_deviceRows;
 bool g_flyoutVisible = false;
 bool g_flyoutRefreshing = false;
 ULONGLONG g_flyoutHiddenTick = 0; // guards against reopening on the click that just closed it
+
+// The XAML island's own child window (IDesktopWindowXamlSourceNative2::
+// get_WindowHandle). It starts out at 0x0 and the framework never resizes it
+// with the host window, so the app has to size it — without that the flyout
+// window opens but stays entirely unpainted.
+HWND g_hWndFlyoutXaml = nullptr;
+
+// XAML framework core window for the UI thread. Must be initialised before the
+// first DesktopWindowXamlSource is created on that thread.
+WindowsXamlManager g_xamlManager{ nullptr };
+
+// Thread that owns g_hWnd, the message loop and every XAML object. XAML objects
+// are not agile, so anything that touches them has to run here.
+DWORD g_uiThreadId = 0;
 
 std::unordered_map<std::wstring, std::pair<DeviceInformation, AudioPlaybackConnection>> g_audioPlaybackConnections;
 std::mutex g_connectionsMutex; // Protects g_audioPlaybackConnections

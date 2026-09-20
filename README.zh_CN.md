@@ -17,7 +17,7 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 - **语言：** C++20 (latest standard)，C++/WinRT 2.0，WIL
 - **UI：** Win32 窗口 + XAML Islands (`DesktopWindowXamlSource`)
 - **设备列表：** 自绘弹窗，带刷新动效线条与刷新按钮 —— 系统 `DevicePicker` 无法承载这两者
-- **线程模型：** 单线程套间 (`winrt::init_apartment()`)
+- **线程模型：** 单线程套间 —— `winrt::init_apartment(winrt::apartment_type::single_threaded)`。XAML Islands 必须运行在 STA 上；注意 `init_apartment` **默认是 MTA**：在 MTA 下协程每次 `co_await` 之后都会在线程池线程上恢复，于是任何 XAML 调用都会以 `RPC_E_WRONG_THREAD` 失败，而且岛根本无法完成初始化。
 - **工具集：** Visual Studio 2022，v143 平台工具集
 - **系统要求：** Windows 10 2004+ (10.0.19041.0)
 - **作者：** Dearkoma
@@ -104,13 +104,15 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 方面 | 实现方式 |
 |------|----------|
 | 宿主窗口 | 独立的 `WS_POPUP` 窗口 (`WS_EX_TOOLWINDOW \| WS_EX_TOPMOST`)。**刻意不加** `WS_EX_LAYERED` —— XAML Islands 内容在分层窗口中不会渲染，这也是 alpha = 0 的托盘窗口无法承载弹窗的原因。 |
+| 岛的初始化 | 三件事是硬性要求，且都很容易漏：(1) STA（`init_apartment(apartment_type::single_threaded)`）；(2) 创建第一个 `DesktopWindowXamlSource` 之前调用 `WindowsXamlManager::InitializeForCurrentThread()`；(3) 由应用自己给岛的子窗口定尺寸。少任何一项，弹窗窗口都会正常打开但**一个像素都不渲染**。 |
+| 岛的尺寸 | 岛自己的子窗口（`IDesktopWindowXamlSourceNative2::get_WindowHandle`）初始为 0x0，且**绝不会**跟随宿主窗口，因此 `ResizeFlyoutXamlHost()` 在每次宿主尺寸变化时（`FlyoutWndProc` 的 `WM_SIZE`，以及每次弹窗 `SetWindowPos` 之后）重新设置它的尺寸。 |
 | 生命周期 | 窗口与 XAML 树在首次打开时创建，之后隐藏时保持存活，因此连接状态在多次开关之间得以保留。 |
 | 布局 | 头部（标题 + "N 台已连接" 副标题 + 刷新按钮）→ 3px 刷新动效线 → 可滚动的设备列表。动效线的边框在空闲时依然可见，因此显示/隐藏它不会引起列表跳动。 |
 | 刷新动效 | 3px `Border` 内嵌一个不确定进度的 `ProgressBar`。仅在刷新进行中显示；同一时间刷新按钮被禁用，副标题切换为"正在检测连接状态"。 |
 | 刷新按钮 | 重新执行 `RefreshDeviceList()`，重新查询 `System.Devices.Aep.IsConnected`。 |
 | 设备行 | 设备名、状态文本和一个操作按钮 —— *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）。已连接的设备排在最前。 |
 | 原地更新 | `UpdateDeviceStatus` 直接修改既有行的状态文本、按钮文字、按钮颜色与目标操作；只有在刷新时才重建整个列表。按钮点击处理器捕获 `shared_ptr<DeviceRowState>`，因此可以重新指定某一行的操作（连接 → 断开）而无需重建。 |
-| 定位 | 通过 `Shell_NotifyIconGetRect` 锚定在托盘图标上方并右对齐，再钳制到最近显示器的工作区内，高度按测量出的内容高度设置。 |
+| 定位 | 通过 `Shell_NotifyIconGetRect` 锚定在托盘图标上方并右对齐，再钳制到最近显示器的工作区内。高度由固定的头部/行高指标（`FlyoutHeightForRows`）算出，而不是靠 `Measure` —— 岛的 XAML 树布局由岛自己负责 —— 并在每次刷新后重设，且保持底边不动。 |
 | 关闭方式 | 轻量关闭：焦点离开时（`WM_ACTIVATE`/`WA_INACTIVE`）自动隐藏。`g_flyoutHiddenTick` 记录关闭时刻，使"刚刚关闭它的那一次点击"不会立刻重新打开（300ms 保护）。 |
 | 主题 | 颜色按明/暗两套调色板硬编码 —— 没有 `Xaml.Application` 的岛无法解析 `ThemeResource` 查找。调色板取自与托盘图标相同的 `SystemUsesLightTheme` 注册表值。 |
 
@@ -121,7 +123,10 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | `g_audioPlaybackConnections` | `unordered_map<wstring, pair<DeviceInformation, AudioPlaybackConnection>>` | 活跃连接表，以设备 ID 为键 |
 | `g_connectionsMutex` | `std::mutex` | 保护连接表的互斥锁 |
 | `g_hWndFlyout` | `HWND` | 承载弹窗岛的弹出窗口（首次打开时创建） |
+| `g_hWndFlyoutXaml` | `HWND` | 岛自己的子窗口 —— 真正绘制 XAML 的那块表面。由本程序设置尺寸，框架从不代劳。 |
 | `g_flyoutSource` / `g_flyoutRoot` | `DesktopWindowXamlSource` / `Grid` | XAML 岛与其 XAML 树，隐藏时保持存活 |
+| `g_xamlManager` | `WindowsXamlManager` | UI 线程的 XAML 框架核心窗口（在第一个岛创建之前初始化） |
+| `g_uiThreadId` | `DWORD` | 拥有 `g_hWnd`、消息循环与所有 XAML 对象的线程 —— `RunOnUiThread` 向它投递 |
 | `g_deviceRows` | `vector<DeviceRow>` | 已渲染的行；每行持有状态 `TextBlock`、操作 `Button` 和一个 `shared_ptr` 状态，使该行可被重新指定操作而无需重建 |
 | `g_flyoutRefreshing` | `bool` | 是否有刷新在进行 —— 驱动动效线并禁用刷新按钮 |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | 可见性，以及防止"关闭它的那次点击"重新打开的时钟保护 |
@@ -136,10 +141,11 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | `WM_NOTIFYICON` (`WM_APP+1`) | 托盘图标点击、右键菜单 |
 | `WM_CONNECTDEVICE` (`WM_APP+2`) | 启动时自动重连触发器 |
 | `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged → UI 线程切换（线程安全） |
+| `WM_RUNONUITHREAD` (`WM_APP+4`) | 携带 `RunOnUiThread` 投递的可调用对象，由 WndProc 在 UI 线程上执行 |
 
 ### 线程安全（关键约束）
 
-1. **所有 XAML 对象访问必须在 UI 线程。** XAML Islands 对象有线程亲和性。
+1. **所有 XAML 对象访问必须在 UI 线程。** XAML Islands 对象有线程亲和性，且不具备 agile 特性。本程序运行在 STA 上，协程恢复点因此落回 UI 线程；此外每个改 XAML 的辅助函数都会再校验一次 `g_uiThreadId`，一旦发现不在 UI 线程就通过 `RunOnUiThread` 把自己重新投递回去。（这一点成立的前提是 `init_apartment` 收到了 `apartment_type::single_threaded` —— 它的默认值是 MTA，那样每一次 `co_await` 恢复都会落到线程池线程上，所有 XAML 更新都会以 `RPC_E_WRONG_THREAD` 失败。）
 2. **所有对 `g_audioPlaybackConnections` 的修改由 `g_connectionsMutex` 保护。** 无锁读写 = 数据竞争。
 3. **`StateChanged` 回调在蓝牙/音频后台线程触发。** 绝对不能直接操作 XAML 或 map，只能通过 PostMessage 将工作转到 UI 线程。
 4. **`ConnectDevice` 是 `fire_and_forget` 协程。** 协程恢复点在 UI 线程（STA），为了一致性仍然持锁。

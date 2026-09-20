@@ -17,7 +17,7 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 - **Language:** C++20 (latest standard), C++/WinRT 2.0, WIL
 - **UI:** Win32 window + XAML Islands (`DesktopWindowXamlSource`)
 - **Device list:** self-drawn flyout with a live refresh indicator and a refresh button — the system `DevicePicker` can host neither
-- **Threading:** Single-threaded apartment (`winrt::init_apartment()`)
+- **Threading:** Single-threaded apartment — `winrt::init_apartment(winrt::apartment_type::single_threaded)`. XAML islands require an STA, and note that `init_apartment` **defaults to MTA**: in an MTA a coroutine resumes on a thread pool thread after every `co_await`, so any XAML call from there fails with `RPC_E_WRONG_THREAD`, and the island never initialises at all.
 - **Toolset:** Visual Studio 2022, v143 platform toolset
 - **OS Target:** Windows 10 2004+ (10.0.19041.0)
 - **Author:** Dearkoma
@@ -107,13 +107,15 @@ flyout replaces it so the whole surface is under the app's control.
 | Aspect | Implementation |
 |--------|----------------|
 | Host window | Dedicated `WS_POPUP` window (`WS_EX_TOOLWINDOW \| WS_EX_TOPMOST`). **Not** `WS_EX_LAYERED` — XAML Islands content does not composite inside a layered window, which is also why the alpha-0 tray window cannot host the flyout. |
+| Island setup | Three things are mandatory and easy to miss: (1) an STA (`init_apartment(apartment_type::single_threaded)`), (2) `WindowsXamlManager::InitializeForCurrentThread()` before the first `DesktopWindowXamlSource`, and (3) sizing the island's own child window. Skip any of them and the flyout window opens but stays completely unpainted. |
+| Island sizing | The island's child window (`IDesktopWindowXamlSourceNative2::get_WindowHandle`) starts at 0x0 and **never** follows the host window, so `ResizeFlyoutXamlHost()` re-sizes it on every host resize (`WM_SIZE` in `FlyoutWndProc`, and after each `SetWindowPos` of the flyout). |
 | Lifetime | Window and XAML tree are created on first use and then kept alive while hidden, so connection state survives between opens. |
 | Layout | Header (title + "N connected" subtitle + refresh button) → 3px refresh indicator → scrolling device list. The indicator's border stays visible when idle, so toggling it never shifts the list. |
 | Refresh indicator | An indeterminate `ProgressBar` inside a 3px `Border`. Visible only while a refresh is in flight; the refresh button is disabled at the same time, and the subtitle switches to "Checking connection status". |
 | Refresh button | Re-runs `RefreshDeviceList()`, re-querying `System.Devices.Aep.IsConnected`. |
 | Device rows | Name, status text and one action button — *Connect* / *Disconnect* / *Retry* (`None` disables the button while a connect is in flight). Connected devices are sorted first. |
 | In-place update | `UpdateDeviceStatus` mutates the existing row's status text, button label, button colour and target action; the list is only rebuilt on a refresh. The click handler captures a `shared_ptr<DeviceRowState>`, so a row's action can be re-targeted (connect → disconnect) without rebuilding it. |
-| Positioning | Anchored above and right-aligned to the tray icon via `Shell_NotifyIconGetRect`, clamped to the nearest monitor's work area, then sized to its measured content height. |
+| Positioning | Anchored above and right-aligned to the tray icon via `Shell_NotifyIconGetRect`, clamped to the nearest monitor's work area. The height is computed from fixed header/row metrics (`FlyoutHeightForRows`) instead of from a `Measure` pass — the island owns the layout of its tree — and is re-applied after every refresh with the bottom edge kept in place. |
 | Dismissal | Light dismiss: the flyout hides on `WM_ACTIVATE`/`WA_INACTIVE`. `g_flyoutHiddenTick` remembers when it closed so the same click that closed it does not immediately reopen it (300 ms guard). |
 | Theme | Colours are hardcoded per light/dark palette — an island with no `Xaml.Application` cannot resolve `ThemeResource` lookups. The palette is chosen from the same `SystemUsesLightTheme` registry value that selects the tray icon. |
 
@@ -124,7 +126,10 @@ flyout replaces it so the whole surface is under the app's control.
 | `g_audioPlaybackConnections` | `unordered_map<wstring, pair<DeviceInformation, AudioPlaybackConnection>>` | Active connections, keyed by device ID |
 | `g_connectionsMutex` | `std::mutex` | Protects the connection map |
 | `g_hWndFlyout` | `HWND` | Popup window hosting the flyout island (created on first open) |
+| `g_hWndFlyoutXaml` | `HWND` | The island's own child window — the surface that actually paints the XAML. Sized by the app, never by the framework. |
 | `g_flyoutSource` / `g_flyoutRoot` | `DesktopWindowXamlSource` / `Grid` | Island and its XAML tree, kept alive while hidden |
+| `g_xamlManager` | `WindowsXamlManager` | XAML framework core window for the UI thread (initialised before the first island) |
+| `g_uiThreadId` | `DWORD` | Thread that owns `g_hWnd`, the message loop and every XAML object — `RunOnUiThread` marshals to it |
 | `g_deviceRows` | `vector<DeviceRow>` | Rendered rows; each holds its status `TextBlock`, action `Button` and a `shared_ptr` state so the row can be re-targeted without a rebuild |
 | `g_flyoutRefreshing` | `bool` | A refresh is in flight — drives the indicator and disables the refresh button |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | Visibility, plus the tick guard that stops the closing click from reopening the flyout |
@@ -139,13 +144,14 @@ flyout replaces it so the whole surface is under the app's control.
 | `WM_NOTIFYICON` (`WM_APP+1`) | System tray icon clicks, context menu |
 | `WM_CONNECTDEVICE` (`WM_APP+2`) | Auto-reconnect trigger on startup |
 | `WM_CONNECTION_CLOSED` (`WM_APP+3`) | StateChanged → UI thread marshal (thread safety) |
+| `WM_RUNONUITHREAD` (`WM_APP+4`) | Carries a callable posted by `RunOnUiThread`; the WndProc invokes it on the UI thread |
 
 ### Thread Safety (critical invariants)
 
-1. **All XAML object access MUST be on the UI thread.** XAML Islands objects have thread affinity.
+1. **All XAML object access MUST be on the UI thread.** XAML Islands objects have thread affinity and are not agile. The app runs an STA, so coroutine continuations resume on the UI thread; every XAML-mutating helper additionally re-checks `g_uiThreadId` and re-posts itself through `RunOnUiThread` if it was called from anywhere else. (This only holds because `init_apartment` is given `apartment_type::single_threaded` — its default is MTA, in which case *every* `co_await` continuation lands on a thread pool thread and all XAML updates fail with `RPC_E_WRONG_THREAD`.)
 2. **All `g_audioPlaybackConnections` mutations guarded by `g_connectionsMutex`.** Read or write the map without the lock = data race.
 3. **`StateChanged` callback fires on a Bluetooth/audio background thread.** It must NEVER touch XAML or the map directly. It posts `WM_CONNECTION_CLOSED` and the WndProc handler does the work.
-4. **`ConnectDevice` is `fire_and_forget`.** Co-routine resumes happen on the UI thread (STA), but the mutex is still held for consistency.
+4. **`ConnectDevice` is `fire_and_forget`.** Co-routine resumes happen on the UI thread (STA), so its `UpdateDeviceStatus` calls are safe; the mutex is still held for consistency.
 5. **`g_shuttingDown` checked at coroutine entry points** — prevents use-after-free during exit.
 6. **Never update XAML while holding `g_connectionsMutex`.** Handlers that walk the connection map (disconnect-all, restart audio, `WM_CONNECTION_CLOSED`) collect the device IDs under the lock, release it, and only then call `UpdateDeviceStatus`. Touching the UI under the lock risks a deadlock and serialises the UI on Bluetooth work.
 
