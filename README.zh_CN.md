@@ -12,10 +12,11 @@
 
 ### 概述
 
-AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 10 2004+ 提供蓝牙 A2DP Sink 功能。它驻留在系统托盘，通过 XAML Islands 弹出窗口让用户选择蓝牙设备。PC 充当蓝牙音箱，接收来自手机/平板的音频流。
+AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 10 2004+ 提供蓝牙 A2DP Sink 功能。它驻留在系统托盘，左键点击弹出**自绘**的设备列表。PC 充当蓝牙音箱，接收来自手机/平板的音频流。
 
 - **语言：** C++20 (latest standard)，C++/WinRT 2.0，WIL
 - **UI：** Win32 窗口 + XAML Islands (`DesktopWindowXamlSource`)
+- **设备列表：** 自绘弹窗，带刷新动效线条与刷新按钮 —— 系统 `DevicePicker` 无法承载这两者
 - **线程模型：** 单线程套间 (`winrt::init_apartment()`)
 - **工具集：** Visual Studio 2022，v143 平台工具集
 - **系统要求：** Windows 10 2004+ (10.0.19041.0)
@@ -53,29 +54,65 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 ```
 wWinMain()
   ├─ winrt::init_apartment()          // STA 单线程套间
-  ├─ CreateWindowExW (1×1 layered)    // 隐藏父窗口，承载 XAML
-  ├─ DesktopWindowXamlSource           // XAML Islands 桥接
-  ├─ LoadSettings()                    // 恢复 g_reconnect、g_lastDevices
-  ├─ SetupFlyout() / SetupMenu()      // XAML 弹出窗口 & 右键菜单
-  ├─ SetupDevicePicker()              // DevicePicker + A2DP 设备筛选
+  ├─ CreateWindowExW (1×1 layered)    // 仅托盘的窗口，alpha = 0
+  ├─ LoadSettings()                   // 恢复 g_reconnect、g_lastDevices
   ├─ SetupSvgIcon()                   // Direct2D → HICON 图标（亮/暗色）
+  ├─ UpdateNotifyIcon()               // Shell_NotifyIcon
   ├─ PostMessage(WM_CONNECTDEVICE)    // 启动时自动重连
   └─ GetMessage 消息循环              // 阻塞等待消息（无轮询）
+                                      // PreTranslateMessage → 弹窗岛（键盘/输入法）
 
-用户点击设备 → ConnectDevice() [fire_and_forget 协程]
+启动时不创建任何 XAML 岛：右键菜单是纯 Win32 弹出菜单，设备弹窗（含自己的岛）
+在第一次左键点击时才构建。
+
+托盘图标左键点击 → ShowDeviceFlyout()
+  ├─ CreateFlyout()                   // 仅一次：弹出窗口 + XAML 岛 + XAML 树
+  ├─ 测量内容、钳制高度、对齐到托盘图标上方
+  ├─ SetWindowPos(SWP_SHOWWINDOW)     // g_flyoutVisible = true
+  └─ RefreshDeviceList()              // 异步执行
+
+RefreshDeviceList() [fire_and_forget]
+  ├─ SetFlyoutRefreshing(true)        // 动效线条开启，刷新按钮禁用
+  ├─ co_await DeviceInformation::FindAllAsync(GetDeviceSelector(),
+  │            { System.Devices.Aep.IsConnected })   // 挂起等待
+  └─ RebuildDeviceRows()              // 已连接设备排在最前
+     SetFlyoutRefreshing(false)
+
+行内按钮点击 → ConnectDevice() / DisconnectDevice()
+ConnectDevice(DeviceInformation) [fire_and_forget]
+  ├─ UpdateDeviceStatus("Connecting") // 原地更新该行，按钮禁用
   ├─ AudioPlaybackConnection::TryCreateFromId()
   ├─ 注册 StateChanged 回调         // → PostMessage(WM_CONNECTION_CLOSED)
   ├─ connection.StartAsync()          // 挂起等待
   ├─ connection.OpenAsync()           // 挂起等待
-  └─ 成功：显示 "Connected" 状态
-     失败：关闭连接、从 map 移除、显示错误状态
+  └─ 成功：UpdateDeviceStatus("Connected", Disconnect)
+     失败：关闭连接、从 map 移除、UpdateDeviceStatus(错误信息, Retry)
 
-StateChanged (CLOSED 状态)           // 在蓝牙/音频线程触发
+StateChanged (CLOSED 状态)            // 在蓝牙/音频线程触发
   └─ PostMessage(WM_CONNECTION_CLOSED) // 切换到 UI 线程处理
 
-WndProc / WM_CONNECTION_CLOSED       // 仅在 UI 线程执行
-  └─ 加锁 → 从 map 删除 → 更新 DevicePicker UI
+WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
+  └─ 加锁 → 从 map 删除 → 解锁 → UpdateDeviceStatus("Not connected", Connect)
 ```
+
+### 设备弹窗（自绘）
+
+设备列表由应用自己绘制，不再使用系统 `DevicePicker`。
+
+`DevicePicker` 只能自定义标题、几个颜色和每行的状态文本，**没有任何接口**可以加入刷新动效或刷新按钮。结果是用户既看不出列表正在重新检测，也无法主动触发重新检测。因此改为自绘弹窗，把整个界面收回到自己手里。
+
+| 方面 | 实现方式 |
+|------|----------|
+| 宿主窗口 | 独立的 `WS_POPUP` 窗口 (`WS_EX_TOOLWINDOW \| WS_EX_TOPMOST`)。**刻意不加** `WS_EX_LAYERED` —— XAML Islands 内容在分层窗口中不会渲染，这也是 alpha = 0 的托盘窗口无法承载弹窗的原因。 |
+| 生命周期 | 窗口与 XAML 树在首次打开时创建，之后隐藏时保持存活，因此连接状态在多次开关之间得以保留。 |
+| 布局 | 头部（标题 + "N 台已连接" 副标题 + 刷新按钮）→ 3px 刷新动效线 → 可滚动的设备列表。动效线的边框在空闲时依然可见，因此显示/隐藏它不会引起列表跳动。 |
+| 刷新动效 | 3px `Border` 内嵌一个不确定进度的 `ProgressBar`。仅在刷新进行中显示；同一时间刷新按钮被禁用，副标题切换为"正在检测连接状态"。 |
+| 刷新按钮 | 重新执行 `RefreshDeviceList()`，重新查询 `System.Devices.Aep.IsConnected`。 |
+| 设备行 | 设备名、状态文本和一个操作按钮 —— *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）。已连接的设备排在最前。 |
+| 原地更新 | `UpdateDeviceStatus` 直接修改既有行的状态文本、按钮文字、按钮颜色与目标操作；只有在刷新时才重建整个列表。按钮点击处理器捕获 `shared_ptr<DeviceRowState>`，因此可以重新指定某一行的操作（连接 → 断开）而无需重建。 |
+| 定位 | 通过 `Shell_NotifyIconGetRect` 锚定在托盘图标上方并右对齐，再钳制到最近显示器的工作区内，高度按测量出的内容高度设置。 |
+| 关闭方式 | 轻量关闭：焦点离开时（`WM_ACTIVATE`/`WA_INACTIVE`）自动隐藏。`g_flyoutHiddenTick` 记录关闭时刻，使"刚刚关闭它的那一次点击"不会立刻重新打开（300ms 保护）。 |
+| 主题 | 颜色按明/暗两套调色板硬编码 —— 没有 `Xaml.Application` 的岛无法解析 `ThemeResource` 查找。调色板取自与托盘图标相同的 `SystemUsesLightTheme` 注册表值。 |
 
 ### 全局状态（`AudioPlaybackConnector.h`）
 
@@ -83,7 +120,11 @@ WndProc / WM_CONNECTION_CLOSED       // 仅在 UI 线程执行
 |------|------|------|
 | `g_audioPlaybackConnections` | `unordered_map<wstring, pair<DeviceInformation, AudioPlaybackConnection>>` | 活跃连接表，以设备 ID 为键 |
 | `g_connectionsMutex` | `std::mutex` | 保护连接表的互斥锁 |
-| `g_devicePicker` | `DevicePicker` (XAML) | 设备列表弹出 UI |
+| `g_hWndFlyout` | `HWND` | 承载弹窗岛的弹出窗口（首次打开时创建） |
+| `g_flyoutSource` / `g_flyoutRoot` | `DesktopWindowXamlSource` / `Grid` | XAML 岛与其 XAML 树，隐藏时保持存活 |
+| `g_deviceRows` | `vector<DeviceRow>` | 已渲染的行；每行持有状态 `TextBlock`、操作 `Button` 和一个 `shared_ptr` 状态，使该行可被重新指定操作而无需重建 |
+| `g_flyoutRefreshing` | `bool` | 是否有刷新在进行 —— 驱动动效线并禁用刷新按钮 |
+| `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | 可见性，以及防止"关闭它的那次点击"重新打开的时钟保护 |
 | `g_reconnect` | `bool` | 下次启动时自动重连 |
 | `g_shuttingDown` | `bool` | 退出时阻止协程访问已释放资源 |
 | `g_lastDevices` | `vector<wstring>` | 用于自动重连的设备 ID 列表 |
@@ -103,6 +144,7 @@ WndProc / WM_CONNECTION_CLOSED       // 仅在 UI 线程执行
 3. **`StateChanged` 回调在蓝牙/音频后台线程触发。** 绝对不能直接操作 XAML 或 map，只能通过 PostMessage 将工作转到 UI 线程。
 4. **`ConnectDevice` 是 `fire_and_forget` 协程。** 协程恢复点在 UI 线程（STA），为了一致性仍然持锁。
 5. **所有协程入口检查 `g_shuttingDown`** — 防止退出时的 use-after-free。
+6. **绝不在持有 `g_connectionsMutex` 时更新 XAML。** 需要遍历连接表的地方（断开全部、重启蓝牙音频、`WM_CONNECTION_CLOSED`）先加锁收集设备 ID，解锁后再调用 `UpdateDeviceStatus`。持锁操作 UI 有死锁风险，也会让 UI 被蓝牙操作串行阻塞。
 
 ### 已知物理限制
 

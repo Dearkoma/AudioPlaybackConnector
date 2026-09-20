@@ -12,10 +12,11 @@ The author is sensitive to ambient noise — they prefer wearing headphones at a
 
 ### Overview
 
-AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that enables Bluetooth A2DP Sink on Windows 10 2004+. It lives in the system tray and provides a XAML Islands flyout for device selection. The PC acts as a Bluetooth speaker, receiving audio from phones/tablets.
+AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that enables Bluetooth A2DP Sink on Windows 10 2004+. It lives in the system tray and opens a self-drawn XAML Islands flyout listing the available devices. The PC acts as a Bluetooth speaker, receiving audio from phones/tablets.
 
 - **Language:** C++20 (latest standard), C++/WinRT 2.0, WIL
 - **UI:** Win32 window + XAML Islands (`DesktopWindowXamlSource`)
+- **Device list:** self-drawn flyout with a live refresh indicator and a refresh button — the system `DevicePicker` can host neither
 - **Threading:** Single-threaded apartment (`winrt::init_apartment()`)
 - **Toolset:** Visual Studio 2022, v143 platform toolset
 - **OS Target:** Windows 10 2004+ (10.0.19041.0)
@@ -53,29 +54,68 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 ```
 wWinMain()
   ├─ winrt::init_apartment()          // STA
-  ├─ CreateWindowExW (1×1 layered)    // hidden parent for XAML
-  ├─ DesktopWindowXamlSource           // XAML Islands bridge
-  ├─ LoadSettings()                    // restore g_reconnect, g_lastDevices
-  ├─ SetupFlyout() / SetupMenu()      // XAML flyout & context menu
-  ├─ SetupDevicePicker()              // DevicePicker with A2DP filter
+  ├─ CreateWindowExW (1×1 layered)    // tray-only window, alpha 0
+  ├─ LoadSettings()                   // restore g_reconnect, g_lastDevices
   ├─ SetupSvgIcon()                   // Direct2D → HICON light/dark
+  ├─ UpdateNotifyIcon()               // Shell_NotifyIcon
   ├─ PostMessage(WM_CONNECTDEVICE)    // auto-reconnect on start
   └─ GetMessage loop                  // blocks until messages arrive (NO POLLING)
+                                      // PreTranslateMessage → island (keyboard/IME)
 
-User clicks device → ConnectDevice() [fire_and_forget coroutine]
+No XAML island exists at startup: the tray menu is a plain Win32 popup menu, and
+the device flyout (with its own island) is built on the first left click.
+
+Tray icon left click → ShowDeviceFlyout()
+  ├─ CreateFlyout()                   // once: popup window + island + XAML tree
+  ├─ Measure, clamp height, anchor above the tray icon
+  ├─ SetWindowPos(SWP_SHOWWINDOW)     // g_flyoutVisible = true
+  └─ RefreshDeviceList()              // asynchronous
+
+RefreshDeviceList() [fire_and_forget]
+  ├─ SetFlyoutRefreshing(true)        // indicator on, refresh button disabled
+  ├─ co_await DeviceInformation::FindAllAsync(GetDeviceSelector(),
+  │            { System.Devices.Aep.IsConnected })   // suspend & wait
+  └─ RebuildDeviceRows()              // connected devices first
+     SetFlyoutRefreshing(false)
+
+Row button click → ConnectDevice() / DisconnectDevice()
+ConnectDevice(DeviceInformation) [fire_and_forget]
+  ├─ UpdateDeviceStatus("Connecting") // row updated in place, button disabled
   ├─ AudioPlaybackConnection::TryCreateFromId()
   ├─ Register StateChanged callback   // → PostMessage(WM_CONNECTION_CLOSED)
   ├─ connection.StartAsync()          // suspend & wait
   ├─ connection.OpenAsync()           // suspend & wait
-  └─ On success: set "Connected" status
-     On failure: close + erase from map, set error status
+  └─ On success: UpdateDeviceStatus("Connected", Disconnect)
+     On failure: close + erase from map, UpdateDeviceStatus(error, Retry)
 
-StateChanged (CLOSED)                // fires on Bluetooth/audio thread
+StateChanged (CLOSED)                 // fires on Bluetooth/audio thread
   └─ PostMessage(WM_CONNECTION_CLOSED) // marshals to UI thread
 
-WndProc / WM_CONNECTION_CLOSED       // UI thread only
-  └─ lock → erase from map → update DevicePicker UI
+WndProc / WM_CONNECTION_CLOSED        // UI thread only
+  └─ lock → erase from map → unlock → UpdateDeviceStatus("Not connected", Connect)
 ```
+
+### Device Flyout
+
+The device list is drawn by the app itself rather than by the system `DevicePicker`.
+
+The picker can only be customised with a title, a few colours and a per-row status
+string. It offers no way to add a refresh indicator or a refresh button, so the user
+cannot tell whether the list is being re-checked, and cannot ask for a re-check. The
+flyout replaces it so the whole surface is under the app's control.
+
+| Aspect | Implementation |
+|--------|----------------|
+| Host window | Dedicated `WS_POPUP` window (`WS_EX_TOOLWINDOW \| WS_EX_TOPMOST`). **Not** `WS_EX_LAYERED` — XAML Islands content does not composite inside a layered window, which is also why the alpha-0 tray window cannot host the flyout. |
+| Lifetime | Window and XAML tree are created on first use and then kept alive while hidden, so connection state survives between opens. |
+| Layout | Header (title + "N connected" subtitle + refresh button) → 3px refresh indicator → scrolling device list. The indicator's border stays visible when idle, so toggling it never shifts the list. |
+| Refresh indicator | An indeterminate `ProgressBar` inside a 3px `Border`. Visible only while a refresh is in flight; the refresh button is disabled at the same time, and the subtitle switches to "Checking connection status". |
+| Refresh button | Re-runs `RefreshDeviceList()`, re-querying `System.Devices.Aep.IsConnected`. |
+| Device rows | Name, status text and one action button — *Connect* / *Disconnect* / *Retry* (`None` disables the button while a connect is in flight). Connected devices are sorted first. |
+| In-place update | `UpdateDeviceStatus` mutates the existing row's status text, button label, button colour and target action; the list is only rebuilt on a refresh. The click handler captures a `shared_ptr<DeviceRowState>`, so a row's action can be re-targeted (connect → disconnect) without rebuilding it. |
+| Positioning | Anchored above and right-aligned to the tray icon via `Shell_NotifyIconGetRect`, clamped to the nearest monitor's work area, then sized to its measured content height. |
+| Dismissal | Light dismiss: the flyout hides on `WM_ACTIVATE`/`WA_INACTIVE`. `g_flyoutHiddenTick` remembers when it closed so the same click that closed it does not immediately reopen it (300 ms guard). |
+| Theme | Colours are hardcoded per light/dark palette — an island with no `Xaml.Application` cannot resolve `ThemeResource` lookups. The palette is chosen from the same `SystemUsesLightTheme` registry value that selects the tray icon. |
 
 ### Global State (`AudioPlaybackConnector.h`)
 
@@ -83,7 +123,11 @@ WndProc / WM_CONNECTION_CLOSED       // UI thread only
 |----------|------|---------|
 | `g_audioPlaybackConnections` | `unordered_map<wstring, pair<DeviceInformation, AudioPlaybackConnection>>` | Active connections, keyed by device ID |
 | `g_connectionsMutex` | `std::mutex` | Protects the connection map |
-| `g_devicePicker` | `DevicePicker` (XAML) | Flyout UI for device list |
+| `g_hWndFlyout` | `HWND` | Popup window hosting the flyout island (created on first open) |
+| `g_flyoutSource` / `g_flyoutRoot` | `DesktopWindowXamlSource` / `Grid` | Island and its XAML tree, kept alive while hidden |
+| `g_deviceRows` | `vector<DeviceRow>` | Rendered rows; each holds its status `TextBlock`, action `Button` and a `shared_ptr` state so the row can be re-targeted without a rebuild |
+| `g_flyoutRefreshing` | `bool` | A refresh is in flight — drives the indicator and disables the refresh button |
+| `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | Visibility, plus the tick guard that stops the closing click from reopening the flyout |
 | `g_reconnect` | `bool` | Reconnect on next launch |
 | `g_shuttingDown` | `bool` | Prevent coroutines from touching freed resources on exit |
 | `g_lastDevices` | `vector<wstring>` | Device IDs for auto-reconnect |
@@ -103,6 +147,7 @@ WndProc / WM_CONNECTION_CLOSED       // UI thread only
 3. **`StateChanged` callback fires on a Bluetooth/audio background thread.** It must NEVER touch XAML or the map directly. It posts `WM_CONNECTION_CLOSED` and the WndProc handler does the work.
 4. **`ConnectDevice` is `fire_and_forget`.** Co-routine resumes happen on the UI thread (STA), but the mutex is still held for consistency.
 5. **`g_shuttingDown` checked at coroutine entry points** — prevents use-after-free during exit.
+6. **Never update XAML while holding `g_connectionsMutex`.** Handlers that walk the connection map (disconnect-all, restart audio, `WM_CONNECTION_CLOSED`) collect the device IDs under the lock, release it, and only then call `UpdateDeviceStatus`. Touching the UI under the lock risks a deadlock and serialises the UI on Bluetooth work.
 
 ### Known Physical Limitations
 
