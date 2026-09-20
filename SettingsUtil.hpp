@@ -6,6 +6,7 @@ constexpr auto BUFFER_SIZE = 4096;
 void DefaultSettings()
 {
 	g_reconnect = false;
+	g_fixSilentConnection = true;
 	g_lastDevices.clear();
 	g_language.clear(); // auto-detect
 }
@@ -40,6 +41,10 @@ void LoadSettings()
 		if (reconnect && reconnect.ValueType() == JsonValueType::Boolean)
 			g_reconnect = reconnect.GetBoolean();
 
+		auto fixSilent = jsonObj.TryLookup(L"fixSilentConnection");
+		if (fixSilent && fixSilent.ValueType() == JsonValueType::Boolean)
+			g_fixSilentConnection = fixSilent.GetBoolean();
+
 		auto language = jsonObj.TryLookup(L"language");
 		if (language && language.ValueType() == JsonValueType::String)
 			g_language = std::wstring(language.GetString());
@@ -65,6 +70,7 @@ void SaveSettings()
 	{
 		JsonObject jsonObj;
 		jsonObj.Insert(L"reconnect", JsonValue::CreateBooleanValue(g_reconnect));
+		jsonObj.Insert(L"fixSilentConnection", JsonValue::CreateBooleanValue(g_fixSilentConnection));
 		if (!g_language.empty())
 			jsonObj.Insert(L"language", JsonValue::CreateStringValue(g_language));
 

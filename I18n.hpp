@@ -46,6 +46,8 @@ void BuildChineseMap()
 	hashToStrMap.emplace(H(L"Connect"), L"连接");
 	hashToStrMap.emplace(H(L"Disconnect"), L"断开");
 	hashToStrMap.emplace(H(L"Retry"), L"重试");
+	hashToStrMap.emplace(H(L"Reconnect"), L"重连");
+	hashToStrMap.emplace(H(L"Reconnect when silent"), L"连接后无音频时自动重连");
 	hashToStrMap.emplace(H(L"Refresh"), L"刷新");
 	hashToStrMap.emplace(H(L"This will disconnect and reconnect the audio connections managed by AudioPlaybackConnector.\n\n"
 	                      L"No system services are touched — only this app's own connections are affected.\n"

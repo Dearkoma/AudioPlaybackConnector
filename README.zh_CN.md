@@ -17,6 +17,7 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 - **语言：** C++20 (latest standard)，C++/WinRT 2.0，WIL
 - **UI：** Win32 窗口 + XAML Islands (`DesktopWindowXamlSource`)
 - **设备列表：** 自绘弹窗，带刷新动效线条与刷新按钮 —— 系统 `DevicePicker` 无法承载这两者
+- **静音链路自动恢复：** Windows 报告链路正常、却一个音频字节都没送过来的情形（Windows 各实现上都存在的间歇性 A2DP sink 故障），通过测量输出端点电平识别并自动重连；弹窗里也提供一键**「重连」**
 - **线程模型：** 单线程套间 —— `winrt::init_apartment(winrt::apartment_type::single_threaded)`。XAML Islands 必须运行在 STA 上；注意 `init_apartment` **默认是 MTA**：在 MTA 下协程每次 `co_await` 之后都会在线程池线程上恢复，于是任何 XAML 调用都会以 `RPC_E_WRONG_THREAD` 失败，而且岛根本无法完成初始化。
 - **工具集：** Visual Studio 2022，v143 平台工具集
 - **系统要求：** Windows 10 2004+ (10.0.19041.0)
@@ -55,7 +56,8 @@ AudioPlaybackConnector 是一个单线程 C++/WinRT 桌面应用，为 Windows 1
 wWinMain()
   ├─ winrt::init_apartment()          // STA 单线程套间
   ├─ CreateWindowExW (1×1 layered)    // 仅托盘的窗口，alpha = 0
-  ├─ LoadSettings()                   // 恢复 g_reconnect、g_lastDevices
+  ├─ LoadSettings()                   // 恢复 g_reconnect、g_fixSilentConnection、
+  │                                   // g_lastDevices
   ├─ SetupSvgIcon()                   // Direct2D → HICON 图标（亮/暗色）
   ├─ UpdateNotifyIcon()               // Shell_NotifyIcon
   ├─ PostMessage(WM_CONNECTDEVICE)    // 启动时自动重连
@@ -78,8 +80,8 @@ RefreshDeviceList() [fire_and_forget]
   └─ RebuildDeviceRows()              // 已连接设备排在最前
      SetFlyoutRefreshing(false)
 
-行内按钮点击 → ConnectDevice() / DisconnectDevice()
-ConnectDevice(DeviceInformation) [fire_and_forget]
+行内按钮点击 → ConnectDevice() / DisconnectDevice() / ReconnectDeviceNow()
+ConnectDevice(DeviceInformation, autoReconnectAttempt) [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // 原地更新该行，按钮禁用
   ├─ 先等够重连冷却               // 见下文"连接归属与 sink 生命周期"
   ├─ AudioPlaybackConnection::TryCreateFromId()
@@ -89,7 +91,17 @@ ConnectDevice(DeviceInformation) [fire_and_forget]
   ├─ connection.OpenAsync()           // 挂起等待 —— 请求建立链路
   └─ 成功：State()==Opened → "Connected"，否则 "Connected, no audio"
            （之后若 sink 起来，StateChanged(Opened) 会把该行升级为已连接）
+           → VerifyAudioAfterConnect()      // 见下文
      失败：只关闭本次协程自己拥有的连接，再 UpdateDeviceStatus(错误信息, Retry)
+
+VerifyAudioAfterConnect(device, attempt) [fire_and_forget]
+  ├─ State() != Opened，或默认输出端点在 2.5 秒内始终静音？
+  │    → Windows 报告链路正常、却一个音频字节都没送过来（已知的间歇性
+  │      A2DP sink 故障）。自动执行文档里那套解法：
+  │      DisconnectDevice() → 等 1.5 秒冷却 → ConnectDevice(device, attempt + 1)
+  │      （最多 2 次）
+  │    → 次数用尽：该行显示"已连接，无音频"并给出「重连」按钮
+  └─ 在输出端点上测到音频 → 记一行 "Audio confirmed" 后结束
 
 StateChanged (OPENED 状态)            // 在蓝牙/音频线程触发
   └─ PostMessage(WM_CONNECTION_OPENED) // 切换到 UI 线程处理
@@ -121,6 +133,26 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 行内状态只有 `State() == Opened` 才显示 `Connected`，否则显示 `Connected, no audio` | "已连上"和"音频在流"是两个不同状态，只有后者才有声音 |
 | `WM_CONNECTION_CLOSED` / `WM_CONNECTION_OPENED` 都携带连接身份 | `StateChanged` 在蓝牙线程触发；过期的消息绝不能碰到更新的连接 |
 
+### "连上了却没声音"：这类问题**不在我们这边**
+
+还有另一种故障，用户看到的症状完全一样，但上面那些归属规则救不了它，因为我们这边根本没错：
+
+- Windows 接受了连接，并且报告 `State() == Opened`。
+- 手机确信自己正在往 PC 推流，于是把自己的扬声器静音了。
+- 音频一个字节都没到达输出端点 —— 两端都是静音。
+- 它是**间歇性**的，Windows 上所有 A2DP sink 实现都中招（微软自家的 Bluetooth Audio Receiver 也一样），而**唯一已知的解法就是把链路彻底断掉、重新协商一次**。
+
+`AudioPlaybackConnection` 看不到这个状态（它早就说 `Opened` 了），所以本程序改为**测量默认输出端点的峰值电平**（Core Audio 的 `IAudioMeterInformation`），把"连接后 2.5 秒内完全没有任何音频"判定为坏掉的那种情形，然后自动执行文档里那套解法：
+
+| 组成 | 行为 |
+|------|------|
+| `GetDefaultRenderPeak()` | 默认输出端点的峰值电平；**读不到时返回负数**。读不到一律按"正常"处理，绝不当作静音 —— 否则在本程序查询不了音频栈的机器上，每一条连接都会被误判成坏的。 |
+| `WaitForAudioOnOutputEndpoint()` | 每 250ms 采一次、共观察 2.5 秒；一旦测到音频立刻返回。 |
+| `VerifyAudioAfterConnect()` | 测到静音时：断开 → 等 1.5 秒冷却 → 重连，每次用户主动连接最多自动重连 `kMaxAutoReconnects`（2）次。这个上限正是为了不让"手机其实还没开始放音"演变成无限重连。 |
+| 次数用尽 | 链路原样保留，但那一行不再假装有声音：显示 *已连接，无音频*，旁边给出可手动点的**「重连」**按钮。 |
+| `ReconnectDeviceNow()` | 把手工解法做成一键（断开 + 连接），也就是「重连」按钮调用的东西。 |
+| 右键菜单「连接后无音频时自动重连」 | 关掉这套自动行为（JSON 配置里的 `fixSilentConnection`）。想在某台机器上对比"开着有用/没用"时很方便。 |
+
 ### 设备弹窗（自绘）
 
 设备列表由应用自己绘制，不再使用系统 `DevicePicker`。
@@ -136,7 +168,7 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 布局 | 头部（标题 + "N 台已连接" 副标题 + 刷新按钮）→ 3px 刷新动效线 → 可滚动的设备列表。动效线的边框在空闲时依然可见，因此显示/隐藏它不会引起列表跳动。 |
 | 刷新动效 | 3px `Border` 内嵌一个不确定进度的 `ProgressBar`。仅在刷新进行中显示；同一时间刷新按钮被禁用，副标题切换为"正在检测连接状态"。 |
 | 刷新按钮 | 重新执行 `RefreshDeviceList()`，重新查询 `System.Devices.Aep.IsConnected`。 |
-| 设备行 | 设备名、状态文本和一个操作按钮 —— *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）。已连接的设备排在最前。状态区分 *已连接*（音频正在通过本程序的连接流动）与 *已连接，无音频*（设备已连上但没有音频在流）；按钮只对**本程序自己管理的连接**提供 *断开* —— 只是链路连上（手机与系统相连、但没有本程序的连接对象）的设备提供 *连接*，否则用户看着"已连接"却没有任何办法把声音弄出来。 |
+| 设备行 | 设备名、状态文本，以及最多两个按钮。操作按钮是 *连接* / *断开* / *重试*（`None` 表示连接正在进行中，按钮置灰）；它旁边还有一个「重连」按钮，**仅在本程序持有该连接时出现** —— 别人持有的连接谁也没法重新协商。已连接的设备排在最前。状态区分 *已连接*（音频正在通过本程序的连接流动）与 *已连接，无音频*（设备已连上但没有音频在流）；操作按钮只对**本程序自己管理的连接**提供 *断开* —— 只是链路连上（手机与系统相连、但没有本程序的连接对象）的设备提供 *连接*，否则用户看着"已连接"却没有任何办法把声音弄出来。 |
 | 原地更新 | `UpdateDeviceStatus` 直接修改既有行的状态文本、按钮文字、按钮颜色与目标操作；只有在刷新时才重建整个列表。按钮点击处理器捕获 `shared_ptr<DeviceRowState>`，因此可以重新指定某一行的操作（连接 → 断开）而无需重建。 |
 | 定位 | 通过 `Shell_NotifyIconGetRect` 锚定在托盘图标上方并右对齐，再钳制到最近显示器的工作区内。高度由固定的头部/行高指标（`FlyoutHeightForRows`）算出，而不是靠 `Measure` —— 岛的 XAML 树布局由岛自己负责 —— 并在每次刷新后重设，且保持底边不动。 |
 | 关闭方式 | 轻量关闭：焦点离开时（`WM_ACTIVATE`/`WA_INACTIVE`）自动隐藏。`g_flyoutHiddenTick` 记录关闭时刻，使"刚刚关闭它的那一次点击"不会立刻重新打开（300ms 保护）。 |
@@ -153,10 +185,11 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | `g_flyoutSource` / `g_flyoutRoot` | `DesktopWindowXamlSource` / `Grid` | XAML 岛与其 XAML 树，隐藏时保持存活 |
 | `g_xamlManager` | `WindowsXamlManager` | UI 线程的 XAML 框架核心窗口（在第一个岛创建之前初始化） |
 | `g_uiThreadId` | `DWORD` | 拥有 `g_hWnd`、消息循环与所有 XAML 对象的线程 —— `RunOnUiThread` 向它投递 |
-| `g_deviceRows` | `vector<DeviceRow>` | 已渲染的行；每行持有状态 `TextBlock`、操作 `Button` 和一个 `shared_ptr` 状态，使该行可被重新指定操作而无需重建 |
+| `g_deviceRows` | `vector<DeviceRow>` | 已渲染的行；每行持有状态 `TextBlock`、「重连」`Button`、操作 `Button` 和一个 `shared_ptr` 状态，使该行可被重新指定操作而无需重建 |
 | `g_flyoutRefreshing` | `bool` | 是否有刷新在进行 —— 驱动动效线并禁用刷新按钮 |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | 可见性，以及防止"关闭它的那次点击"重新打开的时钟保护 |
 | `g_reconnect` | `bool` | 下次启动时自动重连 |
+| `g_fixSilentConnection` | `bool` | 对 Windows 报告正常、实际不携带音频的链路自动断开重开（右键菜单中的"连接后无音频时自动重连"） |
 | `g_shuttingDown` | `bool` | 退出时阻止协程访问已释放资源 |
 | `g_lastDevices` | `vector<wstring>` | 用于自动重连的设备 ID 列表 |
 | `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | 每台设备最近一次关闭的时刻 —— 驱动重连冷却 |
@@ -190,6 +223,9 @@ WndProc / WM_CONNECTION_CLOSED        // 仅在 UI 线程执行
 | 菜单项 | 操作 |
 |--------|------|
 | 蓝牙设置 | 打开 `ms-settings:bluetooth` |
+| 语言 ▸ English / 中文 | 切换界面语言（`g_language`），写入配置文件 |
+| 查看日志 | 用默认程序打开 `AudioPlaybackConnector.log` |
 | 断开全部 | 关闭所有连接，立即更新 UI |
 | 重启蓝牙音频 | 全部关闭 → 等待 1 秒 → 逐个错开重连 |
+| 连接后无音频时自动重连 | `g_fixSilentConnection` 的勾选项 —— "连上却没声音"的自动恢复 |
 | 退出 | 弹出确认窗口，可选"下次启动自动重连" |

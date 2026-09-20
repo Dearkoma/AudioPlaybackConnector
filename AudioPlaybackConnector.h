@@ -43,10 +43,16 @@ struct DeviceRowState
 };
 
 // One rendered device row in the self-drawn flyout.
+//
+// Two buttons, because they answer two different questions: "reconnect" (only
+// offered while this app owns a connection) renegotiates the link in place,
+// while the action button connects, disconnects or retries depending on where
+// the device currently is.
 struct DeviceRow
 {
 	std::wstring deviceId;
 	TextBlock statusText{ nullptr };
+	Button reconnectButton{ nullptr };
 	Button actionButton{ nullptr };
 	std::shared_ptr<DeviceRowState> state;
 };
@@ -108,6 +114,10 @@ NOTIFYICONIDENTIFIER g_niid = {
 };
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
+// When set, a connection that Windows reports as open but that carries no audio
+// is automatically disconnected and reopened (see VerifyAudioAfterConnect).
+// On by default: that failure mode is invisible otherwise.
+bool g_fixSilentConnection = true;
 bool g_shuttingDown = false;
 std::vector<std::wstring> g_lastDevices;
 std::wstring g_language; // "" = auto, "en" = English, "zh-CN" = 简体中文

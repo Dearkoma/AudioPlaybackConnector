@@ -18,6 +18,15 @@
 #include <shobjidl_core.h>
 #include <d2d1_3.h>
 #include <shlwapi.h>
+// Core Audio, used to meter the default output endpoint. Windows can report an
+// A2DP sink connection as open while nothing is playing, so the only way to
+// tell "connected" from "connected and actually playing" is to measure it.
+// mmdeviceapi.h needs objbase.h (excluded by WIN32_LEAN_AND_MEAN) and the
+// PROPVARIANT declarations that come with it.
+#include <objbase.h>
+#include <propidl.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 
 // C++ RunTime Header Files
 #include <chrono>
@@ -40,6 +49,7 @@
 #undef GetCurrentTime
 
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Devices.Enumeration.h>
 #include <winrt/Windows.Foundation.Collections.h>
