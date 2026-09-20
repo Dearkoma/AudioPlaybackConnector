@@ -114,10 +114,18 @@ NOTIFYICONIDENTIFIER g_niid = {
 };
 UINT WM_TASKBAR_CREATED = 0;
 bool g_reconnect = false;
-// When set, a connection that Windows reports as open but that carries no audio
-// is automatically disconnected and reopened (see VerifyAudioAfterConnect).
-// On by default: that failure mode is invisible otherwise.
-bool g_fixSilentConnection = true;
+// Off by default. When switched on, the app measures the default output
+// endpoint after a connect, logs what it found (including a full endpoint
+// inventory when the output is silent), and — once per user-initiated connect —
+// disconnects and reopens a link whose output never showed any audio (see
+// VerifyAudioAfterConnect).
+//
+// It is off because a silent output endpoint cannot be told apart from a phone
+// that has not started playing yet, and tearing down a healthy link is what
+// makes the phone pause. Keeping it off also keeps the connect path free of
+// Core Audio calls, so "is this build the one that goes silent?" is a question
+// a test can answer.
+bool g_fixSilentConnection = false;
 bool g_shuttingDown = false;
 std::vector<std::wstring> g_lastDevices;
 std::wstring g_language; // "" = auto, "en" = English, "zh-CN" = 简体中文

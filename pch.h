@@ -27,6 +27,8 @@
 #include <propidl.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+// IPropertyStore is used to read an endpoint's friendly name into the log.
+#include <propsys.h>
 
 // C++ RunTime Header Files
 #include <chrono>

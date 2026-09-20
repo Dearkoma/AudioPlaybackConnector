@@ -17,7 +17,7 @@ AudioPlaybackConnector is a single-threaded C++/WinRT desktop application that e
 - **Language:** C++20 (latest standard), C++/WinRT 2.0, WIL
 - **UI:** Win32 window + XAML Islands (`DesktopWindowXamlSource`)
 - **Device list:** self-drawn flyout with a live refresh indicator and a refresh button — the system `DevicePicker` can host neither
-- **Silent-link recovery:** a connection Windows reports as open but that carries no audio (an intermittent A2DP sink failure seen in every Windows implementation) is detected by metering the output endpoint, and reconnected automatically; the flyout also offers a one-click *Reconnect*
+- **Silent-link detection:** a connection Windows reports as open but that carries no audio (an intermittent A2DP sink failure seen in every Windows implementation) is detected by metering the output endpoint and reported honestly, with a one-click *Reconnect* to run the documented workaround by hand
 - **Threading:** Single-threaded apartment — `winrt::init_apartment(winrt::apartment_type::single_threaded)`. XAML islands require an STA, and note that `init_apartment` **defaults to MTA**: in an MTA a coroutine resumes on a thread pool thread after every `co_await`, so any XAML call from there fails with `RPC_E_WRONG_THREAD`, and the island never initialises at all.
 - **Toolset:** Visual Studio 2022, v143 platform toolset
 - **OS Target:** Windows 10 2004+ (10.0.19041.0)
@@ -81,7 +81,8 @@ RefreshDeviceList() [fire_and_forget]
      SetFlyoutRefreshing(false)
 
 Row button click → ConnectDevice() / DisconnectDevice() / ReconnectDeviceNow()
-ConnectDevice(DeviceInformation, autoReconnectAttempt) [fire_and_forget]
+ConnectDevice(DeviceInformation, autoReconnectAttempt, allowAutoReconnect)
+                                       [fire_and_forget]
   ├─ UpdateDeviceStatus("Connecting") // row updated in place, button disabled
   ├─ Wait out the reconnect cooldown  // see "Connection Ownership" below
   ├─ AudioPlaybackConnection::TryCreateFromId()
@@ -91,18 +92,23 @@ ConnectDevice(DeviceInformation, autoReconnectAttempt) [fire_and_forget]
   ├─ connection.OpenAsync()           // suspend & wait — requests the link
   └─ On success: State()==Opened → "Connected", otherwise "Connected, no audio"
                  (StateChanged(Opened) upgrades the row if the sink comes up later)
-                 → VerifyAudioAfterConnect()          // see below
+                 → VerifyAudioAfterConnect()  // only while *Reconnect when silent* is on
      On failure: close ONLY a connection this coroutine owns, then
                  UpdateDeviceStatus(error, Retry)
 
-VerifyAudioAfterConnect(device, attempt) [fire_and_forget]
-  ├─ State() != Opened, or the default render endpoint stays silent for 2.5 s?
-  │    → Windows reports a healthy link that carries no audio (a known,
-  │      intermittent A2DP sink failure). Do the documented workaround
-  │      automatically: DisconnectDevice() → 1.5 s cooldown
-  │      → ConnectDevice(device, attempt + 1)     (at most 2 attempts)
-  │    → attempts exhausted: row shows "Connected, no audio" + a Reconnect button
-  └─ Audio seen on the endpoint → log "Audio confirmed" and stop
+VerifyAudioAfterConnect(device, attempt, allowAutoReconnect) [fire_and_forget]
+  ├─ Wait for the link to actually reach Opened (up to 4 s) — deliberately NOT a
+  │    State() snapshot: OpenAsync returning Success still reports Closed, and
+  │    Opened arrives through StateChanged about a second later
+  ├─ Then sample the default render endpoint every 250 ms for 3 s
+  ├─ Audio seen on the endpoint (or an endpoint that cannot be read) → log
+  │    "Audio confirmed" and stop
+  └─ No audio → log the measurement plus a full endpoint inventory, and the row
+       stops claiming audio is flowing: "Connected, no audio"
+       Only when *Reconnect when silent* is ON and the connect was not itself a
+       manual reconnect: DisconnectDevice() → 1.5 s cooldown →
+       ConnectDevice(..., false). One attempt, and the follow-up connect never
+       re-arms this
 
 StateChanged (OPENED)                 // fires on Bluetooth/audio thread
   └─ PostMessage(WM_CONNECTION_OPENED) // marshals to UI thread
@@ -155,18 +161,24 @@ ownership rules above, because there is nothing wrong on this side:
 
 `AudioPlaybackConnection` cannot see this state — it already says `Opened` — so
 the app measures the **default render endpoint's peak level** instead
-(`IAudioMeterInformation`, via Core Audio) and treats "nothing at all for 2.5 s
-right after connecting" as the broken case. Then it does what the workaround
-prescribes, automatically:
+(`IAudioMeterInformation`, via Core Audio).
+
+**That measurement is a report, not a trigger.** An earlier version disconnected
+the device whenever the output stayed silent for 2.5 s, running the documented
+workaround automatically. It was wrong twice over: a silent output cannot be
+told apart from a phone that has not started playing yet (or is between two
+tracks), so it tore down healthy connections — and because tearing the link down
+makes the phone pause, the next reading was silent too. It proved itself right
+by breaking something that worked. Measuring is what can be automated; deciding
+to reconnect is the user's, which is what the *Reconnect* button is for.
 
 | Piece | Behaviour |
 |-------|-----------|
 | `GetDefaultRenderPeak()` | Peak sample value on the default render endpoint, or **negative** when it cannot be read at all. An unmeasurable endpoint is treated as healthy, never as silence — otherwise every connection would look broken on a machine whose audio stack the app cannot query. |
-| `WaitForAudioOnOutputEndpoint()` | Samples every 250 ms for 2.5 s and resolves as soon as any audio appears. |
-| `VerifyAudioAfterConnect()` | On silence: disconnect → 1.5 s cooldown → reconnect, at most `kMaxAutoReconnects` (2) times per user-initiated connect. The cap is what keeps "the phone simply is not playing yet" from turning into an endless reconnect loop. |
-| Exhausted attempts | The connection is left alone but the row stops claiming audio is flowing: it shows *Connected, no audio* next to a manual **Reconnect** button. |
-| `ReconnectDeviceNow()` | The manual workaround in one click (disconnect + connect), which is what the *Reconnect* button calls. |
-| *Reconnect when silent* (tray menu) | Turns the automatic behaviour off (`fixSilentConnection` in the JSON config). Handy for A/B testing whether it helps on a given machine. |
+| `VerifyAudioAfterConnect()` | Only runs while *Reconnect when silent* is on. Waits for `Opened` (up to 4 s, re-reading the state — never a snapshot), then samples the endpoint every 250 ms for 3 s. On silence it logs the measurement and moves the row to *Connected, no audio*, then disconnects and reopens once — a single attempt per user-initiated connect, and the follow-up connect never re-arms it. |
+| `LogAudioInventory()` | Diagnostics only, written after a silent observation: every active render endpoint with its level, plus the default one's friendly name, volume and mute state. A log sent in then says whether the audio went to another device, whether the default endpoint is muted or at zero, or that nothing entered the audio stack at all. |
+| `ReconnectDeviceNow()` | The manual workaround in one click (disconnect + connect), which is what the *Reconnect* button calls. It never chains into the automatic reconnect — one click, one reconnect. |
+| *Reconnect when silent* (tray menu) | Switches the whole thing on (`fixSilentConnection` in the JSON config). **Off by default**, and off means the connect path makes no Core Audio calls at all — which is exactly why it is off: a silent link and a broken link stop being indistinguishable from this code, and "is this build the one that goes quiet?" becomes a question a test can answer. |
 
 ### Device Flyout
 
@@ -207,7 +219,7 @@ flyout replaces it so the whole surface is under the app's control.
 | `g_flyoutRefreshing` | `bool` | A refresh is in flight — drives the indicator and disables the refresh button |
 | `g_flyoutVisible` / `g_flyoutHiddenTick` | `bool` / `ULONGLONG` | Visibility, plus the tick guard that stops the closing click from reopening the flyout |
 | `g_reconnect` | `bool` | Reconnect on next launch |
-| `g_fixSilentConnection` | `bool` | Automatically disconnect/reopen a link Windows reports as healthy but that carries no audio (tray menu: *Reconnect when silent*) |
+| `g_fixSilentConnection` | `bool` | Off by default. Gates the whole "measure the output endpoint" step: with it on, a silent output is logged (plus an endpoint inventory) and the link is disconnected/reopened once per user-initiated connect (tray menu: *Reconnect when silent*) |
 | `g_shuttingDown` | `bool` | Prevent coroutines from touching freed resources on exit |
 | `g_lastDevices` | `vector<wstring>` | Device IDs for auto-reconnect |
 | `g_lastCloseTime` | `unordered_map<wstring, Clock::time_point>` | When each device was last closed — drives the reconnect cooldown |
@@ -245,5 +257,5 @@ flyout replaces it so the whole surface is under the app's control.
 | View Logs | Opens `AudioPlaybackConnector.log` in the default handler |
 | Disconnect All | Closes all connections, updates UI immediately |
 | Restart Bluetooth Audio | Close all → wait 1s → stagger-reconnect each device |
-| Reconnect when silent | Checkbox for `g_fixSilentConnection` — the automatic "connected but silent" recovery |
+| Reconnect when silent | Checkbox for `g_fixSilentConnection` — lets the app disconnect/reopen a link whose output endpoint measures no audio. Off by default |
 | Exit | Flyout with "Reconnect on next start" checkbox |

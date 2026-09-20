@@ -6,7 +6,10 @@ constexpr auto BUFFER_SIZE = 4096;
 void DefaultSettings()
 {
 	g_reconnect = false;
-	g_fixSilentConnection = true;
+	// Off by default: acting on a silent output endpoint tears down healthy
+	// links, and with it off the connect path stays free of Core Audio calls
+	// (see AudioPlaybackConnector.h).
+	g_fixSilentConnection = false;
 	g_lastDevices.clear();
 	g_language.clear(); // auto-detect
 }
