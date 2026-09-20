@@ -993,7 +993,7 @@ void RebuildDeviceRows(std::vector<DeviceInformation> devices)
 	}
 	std::stable_sort(rows.begin(), rows.end(), [](RowSeed const& a, RowSeed const& b) { return a.connected && !b.connected; });
 
-	for (auto const& row of rows)
+	for (auto const& row : rows)
 	{
 		AppendDeviceRow(row.device, row.connected, row.streaming, row.managed);
 	}
