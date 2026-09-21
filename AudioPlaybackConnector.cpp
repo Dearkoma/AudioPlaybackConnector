@@ -96,6 +96,7 @@ enum : UINT
 	IDM_DISCONNECT_ALL,
 	IDM_RESTART_AUDIO,
 	IDM_LOG_AUDIO_INVENTORY,
+	IDM_RECONNECT_ON_START,
 	IDM_EXIT,
 };
 
@@ -1528,40 +1529,10 @@ void ReconnectDeviceNow(std::wstring const& deviceId)
 	ConnectDevice(deviceId);
 }
 
-void ShowExitConfirmation()
-{
-	bool hasConnections;
-	{
-		std::lock_guard<std::mutex> lock(g_connectionsMutex);
-		hasConnections = !g_audioPlaybackConnections.empty();
-	}
-	if (!hasConnections)
-	{
-		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
-		return;
-	}
-
-	TASKDIALOGCONFIG config{};
-	config.cbSize = sizeof(config);
-	config.hwndParent = g_hWnd;
-	config.dwCommonButtons = TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON;
-	config.pszWindowTitle = L"AudioPlaybackConnector";
-	config.pszMainIcon = TD_INFORMATION_ICON;
-	config.pszMainInstruction = _(L"All connections will be closed.\nExit anyway?");
-	config.pszVerificationText = _(L"Reconnect on next start");
-
-	// The verification checkbox state is an in/out parameter of
-	// TaskDialogIndirect; pre-setting it to TRUE checks it by default.
-	BOOL verifyChecked = g_reconnect ? TRUE : FALSE;
-
-	int buttonPressed = 0;
-	if (SUCCEEDED(TaskDialogIndirect(&config, &buttonPressed, nullptr, &verifyChecked)) && buttonPressed == IDOK)
-	{
-		g_reconnect = verifyChecked ? true : false;
-		SaveSettings();
-		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
-	}
-}
+// Exit used to run a TaskDialog here — OK/Cancel plus a "Reconnect on next
+// start" checkbox — whenever a connection was open. That checkbox is now a
+// checkable item in the tray menu, so Exit is a plain exit: WM_DESTROY still
+// saves the settings and still closes the connections.
 
 HMENU BuildPopupMenu()
 {
@@ -1579,6 +1550,13 @@ HMENU BuildPopupMenu()
 	AppendMenuW(menu, MF_STRING, IDM_DISCONNECT_ALL, _(L"Disconnect All"));
 	AppendMenuW(menu, MF_STRING, IDM_RESTART_AUDIO, _(L"Restart Bluetooth Audio"));
 	AppendMenuW(menu, MF_STRING, IDM_LOG_AUDIO_INVENTORY, _(L"Log Audio Endpoint Inventory"));
+
+	// Checkable item; the check mark comes from g_reconnect and is persisted
+	// the moment the item is toggled, which is what lets Exit stay a plain
+	// exit with no confirmation dialog. MF_UNCHECKED rather than plain
+	// MF_STRING keeps the label in the same column while it is unchecked.
+	AppendMenuW(menu, MF_STRING | (g_reconnect ? MF_CHECKED : MF_UNCHECKED), IDM_RECONNECT_ON_START, _(L"Reconnect on next start"));
+
 	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(menu, MF_STRING, IDM_EXIT, _(L"Exit"));
 
@@ -1622,8 +1600,18 @@ void HandleMenuCommand(int cmd)
 		// disconnects nothing and changes no state.
 		LogAudioInventory();
 		break;
+	case IDM_RECONNECT_ON_START:
+		// Toggle and persist right away: the popup menu is rebuilt on every
+		// open, so the check mark is always live, and Exit no longer has to
+		// ask for this.
+		g_reconnect = !g_reconnect;
+		SaveSettings();
+		LogEvent(L"Reconnect on next start: %s", g_reconnect ? L"on" : L"off");
+		break;
 	case IDM_EXIT:
-		ShowExitConfirmation();
+		// Straight out, connections or not. Closing them and saving the
+		// settings is WM_DESTROY's job.
+		PostMessageW(g_hWnd, WM_CLOSE, 0, 0);
 		break;
 	}
 }

@@ -257,4 +257,5 @@ flyout replaces it so the whole surface is under the app's control.
 | Disconnect All | Closes all connections, updates UI immediately |
 | Restart Bluetooth Audio | Close all → wait 1s → stagger-reconnect each device |
 | Log Audio Endpoint Inventory | Read-only diagnostic: writes every render endpoint and its level, plus the default endpoint's name/volume/mute state, to the log. Changes nothing |
-| Exit | Flyout with "Reconnect on next start" checkbox |
+| Reconnect on next start | **Checkable.** Toggled state is persisted immediately; when checked, the last device list is restored on the next launch |
+| Exit | Exits immediately, no dialog. Settings are saved and all connections are closed on the way out |

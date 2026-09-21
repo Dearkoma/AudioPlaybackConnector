@@ -20,7 +20,6 @@ void BuildChineseMap()
 
 	hashToStrMap.emplace(H(L"Unsupported Operating System"), L"操作系统不支持");
 	hashToStrMap.emplace(H(L"AudioPlaybackConnector is not supported on this operating system version."), L"此操作系统版本不支持 AudioPlaybackConnector。");
-	hashToStrMap.emplace(H(L"All connections will be closed.\nExit anyway?"), L"所有连接将被关闭。\n确定退出吗？");
 	hashToStrMap.emplace(H(L"Reconnect on next start"), L"下次启动时重新连接");
 	hashToStrMap.emplace(H(L"Exit"), L"退出");
 	hashToStrMap.emplace(H(L"Language"), L"语言");
