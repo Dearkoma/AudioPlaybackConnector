@@ -963,7 +963,10 @@ void UpdateFlyoutSubtitle()
 		unsigned connected = 0;
 		for (auto const& row : g_deviceRows)
 		{
-			if (row.state && row.state->action == DeviceAction::Disconnect)
+			// Use the row's linked state, not its action: a device linked
+			// outside this app shows Connect yet is still connected, and the
+			// subtitle must agree with the row's "Connected, no audio" text.
+			if (row.connected)
 			{
 				++connected;
 			}
@@ -1155,7 +1158,7 @@ void AppendDeviceRow(DeviceInformation const& device, bool connected, bool strea
 	divider.Child(row);
 
 	g_flyoutDeviceList.Children().Append(divider);
-	g_deviceRows.push_back(DeviceRow{ state->deviceId, statusText, reconnectButton, actionButton, state });
+	g_deviceRows.push_back(DeviceRow{ state->deviceId, statusText, reconnectButton, actionButton, state, connected });
 }
 
 void RebuildDeviceRows(std::vector<DeviceInformation> devices)
@@ -1402,6 +1405,23 @@ void ShowDeviceFlyout()
 	{
 		ApplyFlyoutTexts();
 
+		// Anchor to the tray icon: above it and right-aligned, like a tray flyout.
+		RECT icon{};
+		if (FAILED(Shell_NotifyIconGetRect(&g_niid, &icon)))
+		{
+			LOG_LAST_ERROR();
+			POINT cursor{};
+			GetCursorPos(&cursor);
+			icon = { cursor.x, cursor.y, cursor.x + 1, cursor.y + 1 };
+		}
+
+		// The window is created at the origin, so reading its DPI before moving
+		// it would size the flyout for whatever monitor that happened to be.
+		// Move it (still hidden) to the tray icon's monitor first, then measure
+		// for the monitor it is actually going to appear on.
+		SetWindowPos(g_hWndFlyout, nullptr, icon.left, icon.top, 0, 0,
+			SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
 		UINT dpi = GetDpiForWindow(g_hWndFlyout);
 		if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
 
@@ -1414,16 +1434,6 @@ void ShowDeviceFlyout()
 		// Measure pass: the island owns the layout of its tree, and interleaving
 		// our own measure with it is fragile.
 		const int height = FlyoutHeightForRows(static_cast<int>(g_deviceRows.size()), dpi);
-
-		// Anchor to the tray icon: above it and right-aligned, like a tray flyout.
-		RECT icon{};
-		if (FAILED(Shell_NotifyIconGetRect(&g_niid, &icon)))
-		{
-			LOG_LAST_ERROR();
-			POINT cursor{};
-			GetCursorPos(&cursor);
-			icon = { cursor.x, cursor.y, cursor.x + 1, cursor.y + 1 };
-		}
 
 		int x = icon.right - width;
 		int y = icon.top - height - MulDiv(8, dpi, USER_DEFAULT_SCREEN_DPI);
@@ -1529,6 +1539,10 @@ void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status
 				{
 					row.state->action = action;
 				}
+				// Only a connection this app holds reaches Disconnect, and that
+				// is exactly the state the subtitle counts. A failed attempt, a
+				// manual disconnect or a closed link all land on other actions.
+				row.connected = action == DeviceAction::Disconnect;
 				if (row.statusText)
 				{
 					row.statusText.Text(status);

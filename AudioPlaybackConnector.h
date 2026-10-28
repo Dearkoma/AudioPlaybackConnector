@@ -55,6 +55,10 @@ struct DeviceRow
 	Button reconnectButton{ nullptr };
 	Button actionButton{ nullptr };
 	std::shared_ptr<DeviceRowState> state;
+	// "Linked" in the row's own sense — managed by this app or reported
+	// connected by the system. Kept separately from the action because an
+	// externally linked device shows Connect, yet is still connected.
+	bool connected = false;
 };
 
 HINSTANCE g_hInst;
