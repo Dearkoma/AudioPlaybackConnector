@@ -79,6 +79,10 @@ std::vector<DeviceRow> g_deviceRows;
 bool g_flyoutVisible = false;
 bool g_flyoutRefreshing = false;
 ULONGLONG g_flyoutHiddenTick = 0; // guards against reopening on the click that just closed it
+// Incremented by every RefreshDeviceList(). Only the newest refresh may publish
+// its result or turn the refresh indicator off; an older enumeration that
+// finishes late must drop its result instead of overwriting the newer one.
+unsigned long long g_flyoutRefreshGeneration = 0;
 
 // The XAML island's own child window (IDesktopWindowXamlSourceNative2::
 // get_WindowHandle). It starts out at 0x0 and the framework never resizes it
@@ -101,6 +105,14 @@ std::mutex g_connectionsMutex; // Protects g_audioPlaybackConnections and g_last
 // just-closed A2DP sink endpoint, and reconnecting into a half-torn-down one is
 // what makes the phone connect while no audio comes out of the speakers.
 std::unordered_map<std::wstring, Clock::time_point> g_lastCloseTime;
+
+// Newest connect attempt per device, plus the token source. A coroutine can be
+// superseded before it owns a connection object at all (while resolving a
+// device id or waiting out the cooldown), so an object-identity check alone is
+// not enough to keep its late result off the row. Protected by
+// g_connectionsMutex, like the connection map.
+std::unordered_map<std::wstring, unsigned long long> g_latestConnectAttempt;
+unsigned long long g_connectAttemptSequence = 0;
 HICON g_hIconLight = nullptr;
 HICON g_hIconDark = nullptr;
 NOTIFYICONDATAW g_nid = {

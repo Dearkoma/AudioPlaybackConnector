@@ -61,12 +61,23 @@ void WriteLogLine(const wchar_t* text)
 // __stdcall matches WIL's callback typedef (needed for the x86 build).
 void __stdcall WriteWilDiagnosticsToFile(wil::FailureInfo const& failure) noexcept
 {
+	// Reporting a failure can itself fail — the log file may be locked or
+	// unwritable — and WIL would then call this callback again for the failure
+	// raised inside WriteLogLine. Without a guard that recursion only ends when
+	// the stack does. Per-thread, because failures are reported on whichever
+	// thread hit them.
+	static thread_local bool s_inFailureCallback = false;
+	if (s_inFailureCallback) return;
+	s_inFailureCallback = true;
+
 	wchar_t message[2048];
 	if (FAILED(wil::GetFailureLogString(message, ARRAYSIZE(message), failure)))
 	{
 		StringCchPrintfW(message, ARRAYSIZE(message), L"HRESULT 0x%08X", failure.hr);
 	}
 	WriteLogLine(message);
+
+	s_inFailureCallback = false;
 }
 
 // Timestamped business-event log entry (wide printf-style format).
@@ -193,6 +204,53 @@ std::chrono::milliseconds ReconnectCooldownRemaining(std::wstring const& deviceI
 	if (elapsed >= kReconnectCooldown) return std::chrono::milliseconds::zero();
 
 	return std::chrono::duration_cast<std::chrono::milliseconds>(kReconnectCooldown - elapsed);
+}
+
+// Records a device that actually reached Opened — the only state that means the
+// sink came up — so the next launch can try to reconnect it. "The request was
+// accepted" is deliberately not enough: a device that only got that far has
+// never worked, and remembering it would make every launch retry a dead link.
+// Entries are never removed automatically; a device that merely happens to be
+// out of range on one launch must still be retried on the next one.
+// UI thread only (same as every other access to g_lastDevices).
+void RememberConnectedDevice(std::wstring const& deviceId)
+{
+	if (std::find(g_lastDevices.begin(), g_lastDevices.end(), deviceId) == g_lastDevices.end())
+	{
+		g_lastDevices.push_back(deviceId);
+	}
+}
+
+// ── Connect attempt ownership ────────────────────────────────────────
+// IsCurrentConnection answers "is this object still the tracked connection",
+// but a coroutine can also be superseded before it has an object to compare:
+// it may still be resolving the device id, or waiting out the reconnect
+// cooldown. A token per attempt covers both. Only the newest attempt for a
+// device may write to that device's row, and only it may proceed to connect
+// after a wait.
+unsigned long long BeginConnectAttempt(std::wstring const& deviceId)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	const auto token = ++g_connectAttemptSequence;
+	g_latestConnectAttempt.insert_or_assign(deviceId, token);
+	return token;
+}
+
+// Supersedes whatever attempt is currently in flight for the device. Called
+// whenever a connection is deliberately closed (Disconnect, Disconnect All,
+// Restart Bluetooth Audio, or the device dropping the link): the UI those
+// attempts would update is no longer theirs.
+void InvalidateConnectAttempt(std::wstring const& deviceId)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	g_latestConnectAttempt.insert_or_assign(deviceId, ++g_connectAttemptSequence);
+}
+
+bool IsLatestConnectAttempt(std::wstring const& deviceId, unsigned long long token)
+{
+	std::lock_guard<std::mutex> lock(g_connectionsMutex);
+	auto it = g_latestConnectAttempt.find(deviceId);
+	return it != g_latestConnectAttempt.end() && it->second == token;
 }
 
 // ── Audio endpoint inventory (diagnostics only) ──────────────────────
@@ -493,6 +551,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (lParam && CompareStringOrdinal(reinterpret_cast<LPCWCH>(lParam), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL)
 		{
 			UpdateNotifyIcon();
+
+			// The flyout's palette is baked into its XAML tree when the tree is
+			// created, and the tree is kept alive while hidden. Rebuild it so a
+			// light/dark switch takes effect without restarting the app; the
+			// device rows are rebuilt by RefreshDeviceList anyway, so nothing is
+			// lost. If it was open, reopen it with the new colours.
+			if (g_flyoutRoot)
+			{
+				const bool wasVisible = g_flyoutVisible;
+				DestroyFlyout();
+				if (wasVisible)
+				{
+					ShowDeviceFlyout();
+				}
+			}
 		}
 		break;
 	case WM_NOTIFYICON:
@@ -553,7 +626,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		{
 			// Stagger reconnects so simultaneous requests don't flood the
 			// Bluetooth stack (same reasoning as RestoreAudioService).
-			ReconnectDevices(std::move(g_lastDevices));
+			// Copy, don't move: the list is the record of devices that really
+			// connected, and a failed reconnect must not empty it.
+			ReconnectDevices(g_lastDevices);
 		}
 		break;
 	case WM_CONNECTION_CLOSED:
@@ -579,6 +654,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (!closedDeviceId.empty())
 		{
+			// The connection is gone on purpose, so any coroutine still working
+			// on this device has been superseded.
+			InvalidateConnectAttempt(closedDeviceId);
+
 			// Start the reconnect cooldown from the moment the link went away:
 			// reconnecting into an endpoint that is still being released is how
 			// a phone ends up "connected" with no audio.
@@ -612,6 +691,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		if (!openedDeviceId.empty())
 		{
+			// This is the moment the sink really came up; only devices that get
+			// here are worth reconnecting on the next start.
+			RememberConnectedDevice(openedDeviceId);
 			LogEvent(L"Audio flowing: %s", openedDeviceName.c_str());
 			UpdateDeviceStatus(openedDeviceId, _(L"Connected"), DeviceAction::Disconnect);
 		}
@@ -1378,6 +1460,10 @@ winrt::fire_and_forget RefreshDeviceList()
 {
 	if (!g_flyoutRoot) co_return;
 
+	// Only the newest refresh may publish its result or turn the indicator off.
+	// Opening the flyout again while a previous enumeration is still in flight
+	// used to let the older call finish first and claim the refresh was over.
+	const auto generation = ++g_flyoutRefreshGeneration;
 	SetFlyoutRefreshing(true);
 
 	try
@@ -1388,6 +1474,7 @@ winrt::fire_and_forget RefreshDeviceList()
 			winrt::single_threaded_vector(std::move(requestedProperties)));
 
 		if (g_shuttingDown) co_return;
+		if (generation != g_flyoutRefreshGeneration) co_return;
 
 		std::vector<DeviceInformation> list;
 		list.reserve(devices.Size());
@@ -1409,7 +1496,11 @@ winrt::fire_and_forget RefreshDeviceList()
 	}
 
 	if (g_shuttingDown) co_return;
-	SetFlyoutRefreshing(false);
+	// A newer refresh owns the indicator now; it will clear it when it finishes.
+	if (generation == g_flyoutRefreshGeneration)
+	{
+		SetFlyoutRefreshing(false);
+	}
 }
 
 void UpdateDeviceStatus(std::wstring_view deviceId, winrt::hstring const& status, DeviceAction action)
@@ -1487,6 +1578,10 @@ void DisconnectDevice(std::wstring const& deviceId)
 		}
 	}
 
+	// Whatever was in flight for this device has been superseded by the user's
+	// request to disconnect it.
+	InvalidateConnectAttempt(deviceId);
+
 	// A manual disconnect arms the reconnect cooldown too: an immediate
 	// reconnect would land on an endpoint that has not been released yet.
 	MarkDeviceClosed(deviceId);
@@ -1497,21 +1592,13 @@ void DisconnectDevice(std::wstring const& deviceId)
 	}
 	else
 	{
-		// The link was established outside this app (for example from Windows
-		// Settings), so it is not in our map. Create a throwaway connection
-		// object for the device and close it so the button still does something.
-		try
-		{
-			if (auto connection = AudioPlaybackConnection::TryCreateFromId(winrt::hstring(deviceId.c_str())))
-			{
-				connection.Close();
-				LogEvent(L"Disconnect (external link): %s", deviceId.c_str());
-			}
-		}
-		catch (winrt::hresult_error const&)
-		{
-			LOG_CAUGHT_EXCEPTION();
-		}
+		// Only a connection this app holds can be closed here. A device that
+		// is merely linked shows Connect (not Disconnect) in the flyout, so
+		// this path is for a stale row or a link that vanished underneath it.
+		// The old throwaway-object fallback could not have closed an external
+		// link anyway: closing an object that was never StartAsync()'d does
+		// not tear down someone else's sink.
+		LogEvent(L"Disconnect ignored (not managed): %s", deviceId.c_str());
 	}
 
 	UpdateDeviceStatus(deviceId, _(L"Not connected"), DeviceAction::Connect);
@@ -1637,9 +1724,27 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 {
 	if (g_shuttingDown) co_return;
 
-	// Kept in locals so they outlive every suspension point below.
-	const std::wstring deviceId(device.Id());
-	const std::wstring deviceName(device.Name());
+	// Kept in locals so they outlive every suspension point below. A device
+	// that disappeared between enumeration and the click can make these throw,
+	// and an exception escaping a fire_and_forget coroutine terminates the
+	// process instead of just failing the connect.
+	std::wstring deviceId;
+	std::wstring deviceName;
+	try
+	{
+		if (!device) co_return;
+		deviceId = std::wstring(device.Id());
+		deviceName = std::wstring(device.Name());
+	}
+	catch (winrt::hresult_error const&)
+	{
+		LOG_CAUGHT_EXCEPTION();
+		co_return;
+	}
+
+	// Every row update below is gated on this attempt still being the newest
+	// one for the device.
+	const auto attempt = BeginConnectAttempt(deviceId);
 
 	LogEvent(L"Connecting: %s", deviceName.c_str());
 
@@ -1664,6 +1769,13 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 			LogEvent(L"Waiting %lld ms before reconnecting: %s", static_cast<long long>(cooldown.count()), deviceName.c_str());
 			co_await winrt::resume_after(cooldown);
 			if (g_shuttingDown) co_return;
+			if (!IsLatestConnectAttempt(deviceId, attempt))
+			{
+				// A newer attempt (or a disconnect) happened while this one was
+				// waiting; proceeding would only fight it for the same device.
+				LogEvent(L"Connect attempt superseded while waiting: %s", deviceName.c_str());
+				co_return;
+			}
 		}
 
 		connection = AudioPlaybackConnection::TryCreateFromId(device.Id());
@@ -1697,6 +1809,11 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 				LogEvent(L"Replacing the tracked connection for: %s", deviceName.c_str());
 				co_await winrt::resume_after(kReconnectCooldown);
 				if (g_shuttingDown) co_return;
+				if (!IsLatestConnectAttempt(deviceId, attempt))
+				{
+					LogEvent(L"Connect attempt superseded while waiting: %s", deviceName.c_str());
+					co_return;
+				}
 			}
 
 			connection.StateChanged([deviceId](const auto& sender, const auto&) {
@@ -1804,10 +1921,24 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 
 	if (success)
 	{
+		// A superseded attempt must not repaint the row. A newer connection, or
+		// a Disconnect All / restart that cleared the map while this coroutine
+		// was suspended, owns what the user is looking at now.
+		if (!IsLatestConnectAttempt(deviceId, attempt) || !IsCurrentConnection(deviceId, connection))
+		{
+			LogEvent(L"Connect result ignored (superseded): %s", deviceName.c_str());
+			co_return;
+		}
+
+		// StateChanged(Opened) flips the row to Connected if the sink comes up
+		// after this point; if it is already up, remember the device now.
+		if (opened)
+		{
+			RememberConnectedDevice(deviceId);
+		}
+
 		// "The request was accepted" and "audio is flowing" are different
 		// states, and only the second one is worth telling the user about.
-		// StateChanged(Opened) flips the row to Connected if the sink comes up
-		// after this point.
 		UpdateDeviceStatus(deviceId, opened ? _(L"Connected") : _(L"Connected, no audio"), DeviceAction::Disconnect);
 		LogEvent(L"Connected: %s  (audio %s)", deviceName.c_str(), opened ? L"flowing" : L"not flowing yet");
 
@@ -1821,11 +1952,15 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 	}
 	else
 	{
-		// Close only a connection this coroutine owns. The map may hold a
-		// different object — a second attempt, or a link the phone established
-		// on its own — and closing that would drop a working connection.
+		// Only the newest attempt may paint its failure. A null connection never
+		// reached the map, so an object-identity check cannot tell it apart from
+		// an attempt that was superseded while resolving or waiting; the token
+		// can.
 		if (connection)
 		{
+			// Close only a connection this coroutine owns. The map may hold a
+			// different object — a second attempt, or a link the phone established
+			// on its own — and closing that would drop a working connection.
 			const bool owned = IsCurrentConnection(deviceId, connection);
 			if (owned)
 			{
@@ -1852,7 +1987,14 @@ winrt::fire_and_forget ConnectDevice(DeviceInformation device)
 		}
 
 		LogEvent(L"Connect failed: %s  (%s)", deviceName.c_str(), errorMessage.c_str());
-		UpdateDeviceStatus(deviceId, winrt::hstring(errorMessage.c_str()), DeviceAction::Retry);
+		if (IsLatestConnectAttempt(deviceId, attempt))
+		{
+			UpdateDeviceStatus(deviceId, winrt::hstring(errorMessage.c_str()), DeviceAction::Retry);
+		}
+		else
+		{
+			LogEvent(L"Connect failure ignored (superseded): %s", deviceName.c_str());
+		}
 	}
 }
 
@@ -1862,9 +2004,46 @@ winrt::fire_and_forget ConnectDevice(std::wstring deviceId)
 
 	// Kept in a local so it outlives the suspension point.
 	const winrt::hstring id(deviceId.c_str());
-	auto device = co_await DeviceInformation::CreateFromIdAsync(id);
-	if (g_shuttingDown) co_return;
-	ConnectDevice(device);
+	const auto attempt = BeginConnectAttempt(deviceId);
+	try
+	{
+		auto device = co_await DeviceInformation::CreateFromIdAsync(id);
+		if (g_shuttingDown) co_return;
+		if (!IsLatestConnectAttempt(deviceId, attempt))
+		{
+			// A newer attempt (or a disconnect) started while this id was being
+			// resolved; it owns the device now.
+			LogEvent(L"Connect attempt superseded: %s", deviceId.c_str());
+			co_return;
+		}
+		if (!device)
+		{
+			LogEvent(L"Connect failed: %s  (device not found)", deviceId.c_str());
+			UpdateDeviceStatus(deviceId, _(L"Unknown error"), DeviceAction::Retry);
+			co_return;
+		}
+		ConnectDevice(device);
+	}
+	catch (winrt::hresult_error const& ex)
+	{
+		// A saved device can be unpaired or removed between launches, and an
+		// exception escaping this fire_and_forget would terminate the process
+		// instead of failing one reconnect attempt.
+		LOG_CAUGHT_EXCEPTION();
+		LogEvent(L"Connect failed: %s  (0x%08X)", deviceId.c_str(), static_cast<uint32_t>(ex.code()));
+		if (IsLatestConnectAttempt(deviceId, attempt))
+		{
+			UpdateDeviceStatus(deviceId, _(L"Unknown error"), DeviceAction::Retry);
+		}
+	}
+	catch (...)
+	{
+		LogEvent(L"Connect failed: %s  (unknown)", deviceId.c_str());
+		if (IsLatestConnectAttempt(deviceId, attempt))
+		{
+			UpdateDeviceStatus(deviceId, _(L"Unknown error"), DeviceAction::Retry);
+		}
+	}
 }
 
 void SetupSvgIcon()
@@ -1933,6 +2112,7 @@ void DisconnectAllDevices()
 	// Rows are updated after the lock is released — see WM_CONNECTION_CLOSED.
 	for (auto const& id : closedIds)
 	{
+		InvalidateConnectAttempt(id);
 		MarkDeviceClosed(id);
 		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}
@@ -1985,6 +2165,7 @@ winrt::fire_and_forget RestoreAudioService()
 
 	for (auto const& id : deviceIds)
 	{
+		InvalidateConnectAttempt(id);
 		MarkDeviceClosed(id);
 		UpdateDeviceStatus(id, _(L"Not connected"), DeviceAction::Connect);
 	}

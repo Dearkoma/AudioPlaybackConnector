@@ -75,13 +75,15 @@ void SaveSettings()
 		if (!g_language.empty())
 			jsonObj.Insert(L"language", JsonValue::CreateStringValue(g_language));
 
+		// g_lastDevices, not the live connection map: the list is the record of
+		// devices that actually reached Opened. Serialising the map instead made
+		// any save without a live connection (toggling the menu item, switching
+		// language, exiting after a failed reconnect) silently erase it, so the
+		// next launch had nothing left to reconnect.
 		JsonArray lastDevices;
+		for (const auto& id : g_lastDevices)
 		{
-			std::lock_guard<std::mutex> lock(g_connectionsMutex);
-			for (const auto& i : g_audioPlaybackConnections)
-			{
-				lastDevices.Append(JsonValue::CreateStringValue(i.first));
-			}
+			lastDevices.Append(JsonValue::CreateStringValue(id));
 		}
 		jsonObj.Insert(L"lastDevices", lastDevices);
 
